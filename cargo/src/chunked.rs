@@ -466,7 +466,9 @@ mod coalesced_read_tests {
     #[test]
     fn a_lone_zero_digit_does_not_end_the_body() {
         let mut d = ChunkedDecoder::new();
-        let r = d.push(b"a\r\ndata: one\n\r\n0").expect("partial input is fine");
+        let r = d
+            .push(b"a\r\ndata: one\n\r\n0")
+            .expect("partial input is fine");
         assert_eq!(r.out, b"data: one\n");
         assert!(
             !r.done,

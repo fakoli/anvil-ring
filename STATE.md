@@ -1,6 +1,6 @@
 # STATE
 
-**Last updated:** 2026-08-28
+**Last updated:** 2026-08-28 (late)
 **Phase:** control plane and data plane are both implemented. The data plane
 forwards and streams, but **does not yet deliver a full multi-event response
 through the tunnel.** Not production-ready.
@@ -59,30 +59,67 @@ through the tunnel.** Not production-ready.
   dependencies for auditability"; replaced with `sha2`. I-7 constrains the
   artifact, not the crate count.
 
-## The bug that is still open
+## The bug that is still open — narrowed to an exact mechanism
 
-The tunnel delivers the **first** event and then ends the stream. Reproduced
-against a fresh hub, one tether, one verified engine. The leading theory, from a
-tether-side trace, is in `tunnel.rs`'s first-read branch: it forwards the head as
-frame 1 and one decoded chunk as frame 2, and the `continue` after that skips the
-`saw_end`/terminator handling, so a coalesced read contributes one event.
-The engine's own response is complete (verified directly against it: 131 bytes,
-three events). The standalone proxy delivers all three.
+The tunnel delivers the first event, then the stream stops. **Two real bugs were
+found and fixed on the way here:**
 
-## Do not trust the earlier "live" results in git history
+1. **`None => break` in the per-stream `select!`.** The request-side receiver
+   yields `None` whenever no sender exists right now — the NORMAL state, since the
+   only holder of the sender is the session loop on another task and a GET with no
+   body sends nothing. Treating that as end-of-stream, in an arm biased by a 1 ms
+   sleep against an engine answering ~300 ms away, cancelled the in-flight engine
+   read. Fixed with a `request_side_idle` latch that DISABLES the arm instead of
+   aborting, preserving both the read and the idle timeout.
+2. **The framing decision was not sticky.** Head and first body bytes usually
+   arrive in separate reads (time-to-first-token), so the old
+   `dechunk.is_none() && !head_seen` guard left `dechunk` unset on body reads,
+   which then forwarded RAW chunk framing. Replaced with a real tri-state
+   `HeadState { Unknown, Chunked, Plain }`.
 
-Two measurement errors contaminated most live testing on 2026-08-28 and are worth
-remembering as method, not as this project's state:
+Verified fixed by trace — the tether now reads the engine continuously:
+`TT2 k=80 state=Unknown`, then `k=15 / k=15 / k=16 / k=5` all `state=Chunked`,
+producing 10/10/11/0 bytes, i.e. all three events de-chunked correctly.
 
-- **Stale processes.** `process kill` reported success while the process survived;
-  tethers from 16 minutes earlier kept holding hub registrations while new ones
-  launched. Always `pkill -9 -f anvil-ring` and verify with `ps` before a run.
-- **`| tee` buffers stderr**, so an absence of trace lines meant "buffered", not
-  "not reached".
+**What is still broken, stated precisely:** those forwarded frames enter the
+tunnel's send channel and NEVER reach the socket. Measured on one run:
 
-Also: byte-identical responses appearing across logically different builds was
-the tell that a "live" run was executing in-process test code, not the binaries.
+- per-stream task: produced 10 + 10 + 11 bytes (all events); `reply.is_closed()`
+  false, `send()` returned Ok — no error surfaced
+- writer task: alive, `rx.recv()` loop intact, `run_session` never returned
+- hub: received exactly ONE 80-byte frame (the head), then nothing for 20 s
+- caller holding the connection open 20 s: 137 bytes total, then nothing
 
+So the loss sits between an accepted `tx.send()` and `sink.send()`. Prime suspect:
+the `reply` sender cloned into the stream task is not bound to the channel the
+writer drains (e.g. cloned before the per-connection `tx` was replaced, or the
+writer draining a different `rx` after a reconnect), so accepted sends land in a
+channel nobody reads — which fits "accepted but never emitted, no error".
+
+NOT YET CONFIRMED. `TT2 SEND FAILED` never fired, so nothing surfaced an error,
+and I did not instrument `tx`/`rx` identity across the clone. Next step is
+exactly that: print the channel/sender identity at clone time and at send time.
+
+## Diagnostic traces ARE IN THE WORKING TREE (remove before shipping)
+
+Uncommitted `eprintln!` traces: `TT2` and `TT3` in tunnel.rs, `HU ` in hub.rs.
+They are the fastest way to re-orient on this bug:
+
+    grep -n 'TT2\|TT3\|HU ' cargo/src/*.rs
+
+Traces write to stderr. NOTE: piping through `tee` BUFFERS stderr, which earlier
+made a live path look dead — read tracked process output directly instead.
+
+## Measurement discipline (earned the hard way, twice)
+
+- `process kill` can report success while the process survives; tethers from
+  16 minutes earlier kept holding hub registrations. Always
+  `pkill -9 -f anvil-ring` and VERIFY with `ps` before a run.
+- `| tee` buffers stderr: absent trace lines mean buffered, not unreached.
+- Byte-identical responses across logically different builds means the run
+  executed in-process test code rather than the binaries under test.
+- Instrument the component you have NOT traced. I theorized about the hub for a
+  long while before tracing it; one `HU DATA n=80` line ended the guessing.
 ## Test inventory
 
 - lib: 38 tests — frames, proxy, headers, hub registry/leases, chunked decoder.

@@ -301,10 +301,13 @@ async fn run_session(
                             let mut dechunk: Option<crate::chunked::ChunkedDecoder> = None;
                             // Set once the engine's response head has been examined.
                             let mut head_seen = false;
+                            // Latched once the request side reports None. See the
+                            // `from_hub` arm: that None is NOT end-of-stream.
+                            let mut request_side_idle = false;
                             loop {
                                 tokio::select! {
                                     biased;
-                                    maybe = from_hub.recv() => match maybe {
+                                    maybe = from_hub.recv(), if !request_side_idle => match maybe {
                                         // Half-close: no more request bytes. Shutdown
                                         // the write half so the engine sees
                                         // end-of-request, then KEEP reading -- the
@@ -327,7 +330,29 @@ async fn run_session(
                                         // tear down a stream whose answer is fine.
                                         Some(_) => {}
                                         // Hub aborted, or the stream map dropped us.
-                                        None => { break; }
+                                        None => {
+                                            // NOT an abort. This receiver yields None
+                                            // whenever no SENDER exists right now,
+                                            // which is the NORMAL state: the only
+                                            // holder of the sender is the session loop
+                                            // on another task, and a GET with no
+                                            // request body never sends anything.
+                                            //
+                                            // Breaking here was a real bug. This arm
+                                            // is biased ahead of `ctx.read`, and the
+                                            // loop also holds a short sleep arm, so
+                                            // this branch wins repeatedly against an
+                                            // engine answering ~300ms away -- and
+                                            // dropping the `ctx.read` future CANCELS an
+                                            // in-flight read. The visible symptom was
+                                            // exactly one forwarded event per response.
+                                            //
+                                            // Disabling the arm (rather than breaking)
+                                            // keeps the engine read in flight AND keeps
+                                            // the idle timeout, which is the sleep
+                                            // arm's whole purpose.
+                                            request_side_idle = true;
+                                        }
                                     },
                                     n = ctx.read(&mut buf) => match n {
                                         Ok(0) => {
@@ -360,10 +385,40 @@ async fn run_session(
                                             // decoded. A plain content-length body must
                                             // pass through byte-for-byte, or we would
                                             // corrupt it by hunting for chunk markers.
-                                            if dechunk.is_none() && !head_seen {
+                                            // Decided ONCE and remembered. The old
+                                            // guard here was
+                                            // `dechunk.is_none() && !head_seen`, i.e.
+                                            // it could run on at most ONE read. A head
+                                            // that arrives alone -- normal, because a
+                                            // model takes time to first token and
+                                            // flushes the head before any event --
+                                            // left `dechunk` None on every BODY read,
+                                            // so those reads took the generic path
+                                            // below and forwarded RAW chunk-framed
+                                            // bytes. The hub parsed frame 1 as the
+                                            // head, read frame 2's size line as body,
+                                            // and the caller got one event plus
+                                            // framing noise. Now the decision is
+                                            // sticky: once `is_chunked` is known,
+                                            // `dechunk` is created here so the generic
+                                            // path always de-frames.
+                                            if !head_seen {
                                                 head_seen = true;
                                                 if let Some((head, body)) = split_head(&buf[..k]) {
                                                     if crate::chunked::is_chunked(head.headers()) {
+                                                        // The decision, made once. Note
+                                                        // this runs for a head that
+                                                        // arrives with NO body bytes --
+                                                        // the common production case,
+                                                        // since a model flushes the head
+                                                        // before its first token. The
+                                                        // old guard (`dechunk.is_none()`)
+                                                        // could not distinguish "haven't
+                                                        // looked" from "looked, decided
+                                                        // plain", and a lone head left
+                                                        // every body read to forward raw
+                                                        // chunk framing.
+                                                        dechunk = Some(crate::chunked::ChunkedDecoder::new());
                                                         // Forward the engine's head VERBATIM as
                                                         // the first DATA frame, THEN the decoded
                                                         // body separately.
@@ -381,7 +436,6 @@ async fn run_session(
                                                         // receives an empty 200".
                                                         let raw_head = buf[..k - body.len()].to_vec();
                                                         if reply.send(msg(Frame::Data { stream: id, bytes: raw_head })).is_err() { break; }
-                                                        dechunk = Some(crate::chunked::ChunkedDecoder::new());
                                                         // Decode the WHOLE remainder of
                                                         // this read, not one chunk.
                                                         //
