@@ -221,10 +221,25 @@ impl Registry {
             streams: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(Mutex::new(1)),
         };
-        self.live
+        // Replace atomically AND drop the predecessor's sender. Dropping it is
+        // what makes the old session task's recv() return None so it exits and
+        // closes its WebSocket; a bare insert left the previous session alive
+        // beside the new one, so a reconnect could leave two live sessions under
+        // one tether id, each holding its own socket and stream map. Observed
+        // directly as two `authorized ... / event Up` pairs interleaved for one
+        // tether, with an in-flight stream's frames going to the abandoned one.
+        //
+        // Take-then-insert inside one lock hold: the map never momentarily
+        // contains neither session, and no other thread can observe or forward
+        // to a session between the two steps.
+        let previous = self
+            .live
             .lock()
             .unwrap()
             .insert(id.to_string(), session.clone());
+        // Dropped OUTSIDE the lock: a Drop that wakes another task must not run
+        // while the registry mutex is held.
+        drop(previous);
         session
     }
 
@@ -474,15 +489,46 @@ impl Forwarded {
     /// parses them out of the first DATA frame; a proxy that only looked at the
     /// body could not distinguish an engine 500 from an engine 200.
     pub async fn head(&self) -> Option<http::Response<()>> {
-        // The head is written by the session task between DATA frames, so poll for
-        // it rather than assuming it is present on first read.
-        for _ in 0..200 {
+        // Wait for the head with NO fixed budget.
+        //
+        // This used to poll 200 x 5ms (~1s) and then return None. Returning None
+        // here was not a timeout -- it was a WRONG ANSWER, and worse than the
+        // fabricated 200 it replaced. The head does eventually arrive; by then
+        // the caller had been handed a response built from whatever bytes
+        // `parse_head` had already yielded as `rest`, and the stream was
+        // abandoned. Measured against an engine slower than ~1s to first byte,
+        // the caller received a truncated body whose framing leaked through:
+        // `A\r\ndata: one\n\r\n0\r\n\r\n`, i.e. one chunk-size line and one
+        // event, presented as a complete answer. A time-to-first-token of a few
+        // seconds is normal for an inference engine, so the old budget fired on
+        // ordinary traffic, not on a pathological one.
+        //
+        // Waiting indefinitely is correct here because the wait is NOT unbounded
+        // in practice: it ends the moment the head arrives, the stream ends
+        // (END/GoAway closes the chunk channel, and `completed` is set), or the
+        // caller disconnects -- and a disconnected caller stops driving this
+        // future, so it is dropped rather than left polling. Tether death is not
+        // a hole either: the session loop's exit drops the stream map, which
+        // drops the state this borrows, so there is no liveness path that leaves
+        // it waiting on a dead peer.
+        loop {
             if let Some(res) = self.state.head.lock().unwrap().clone() {
                 return Some(res);
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            // Set when the engine's END arrives, or when the stream is aborted
+            // (tether death drops the stream map, which drops the guard). Either
+            // way no head can still arrive, so this is a real failure and the
+            // caller answers 502 (I-11) rather than reporting a partial success.
+            if self.state.completed.load(Ordering::SeqCst) {
+                return None;
+            }
+            // Yield so the session task that WRITES the head can run. A short
+            // sleep rather than a Notify: the head is written between DATA
+            // frames on a task this future cannot wake directly, and the loop
+            // exits on the head itself -- so unlike the old budget this never
+            // gives up, it only re-checks.
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        None
     }
 
     /// Hand the response receiver to the caller-facing frontend, which becomes its
@@ -786,6 +832,7 @@ async fn handle_tether(
                             }
                             Some(st) => {
                                 if st.head.lock().unwrap().is_none() {
+                                
                                     // The first chunk carries the engine's status
                                     // line; the tether forwarded raw HTTP bytes.
                                     // Any bytes buffered from an earlier unparsable
@@ -801,7 +848,7 @@ async fn handle_tether(
                                         v
                                     };
                                     if let Some((res, rest)) = parse_head(&bytes) {
-                                    
+
                                         *st.head.lock().unwrap() = Some(res);
                                         if !rest.is_empty()
                                             && st.chunks_tx().send(ChunkOrEnd::Chunk(rest)).await.is_err()
@@ -850,7 +897,7 @@ async fn handle_tether(
                                         }
                                     }
                                 } else if st.chunks_tx().send(ChunkOrEnd::Chunk(Bytes::from(bytes))).await.is_err() {
-                                
+
                                     // Caller vanished: close the stream at the tether.
                                     let _ = sink.send(ws_msg(Frame::End { stream: id, reason: Vec::new() })).await;
                                 }
@@ -1081,6 +1128,9 @@ mod parse_head_rest_tests {
     fn lone_head_has_empty_rest() {
         let wire = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
         let (_res, rest) = parse_head(wire).expect("head should parse");
-        assert!(rest.is_empty(), "lone head must not fabricate body bytes: {rest:?}");
+        assert!(
+            rest.is_empty(),
+            "lone head must not fabricate body bytes: {rest:?}"
+        );
     }
 }

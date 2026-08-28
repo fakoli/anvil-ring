@@ -479,3 +479,47 @@ mod coalesced_read_tests {
         assert!(r2.out.is_empty(), "no body bytes remain to emit");
     }
 }
+
+#[cfg(test)]
+mod composed_path_tests  {
+    use super::*;
+
+    /// THE shape the live engine actually puts on the wire for an SSE response:
+    /// a head WITH transfer-encoding, then chunk-coded events. `is_chunked` must
+    /// see the header as it arrives on the socket -- before any hop-by-hop
+    /// stripping -- or the tether forwards raw chunk framing as the body.
+    ///
+    /// This test exists because the tether was measured forwarding raw framing
+    /// (`A\r\n` + `\n`) while its own decoder unit tests all passed: the tests
+    /// checked the decoder and the header helper SEPARATELY, and nothing checked
+    /// the one composed path that decides between them.
+    #[test]
+    fn is_chunked_is_true_for_a_real_sse_head_and_the_decoder_agrees() {
+        let wire = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+        let (res, rest) = crate::hub::parse_head(wire).expect("head parses");
+        assert!(rest.is_empty(), "lone head has no body");
+        assert!(
+            is_chunked(res.headers()),
+            "a chunked engine head must be detected as chunked, or the \
+             tether skips de-chunking and leaks framing to the caller"
+        );
+    }
+
+    /// The composed decision on the COALESCED shape: head plus the first event in
+    /// one buffer. Detection AND decoding must both fire from the same bytes.
+    #[test]
+    fn coalesced_head_plus_first_event_dechunks_to_bare_payload() {
+        let wire = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\na\r\ndata: one\n\r\n";
+        let (res, rest) = crate::hub::parse_head(wire).expect("head parses");
+        assert!(is_chunked(res.headers()));
+        assert_eq!(rest.as_ref(), b"a\r\ndata: one\n\r\n");
+
+        let mut d = ChunkedDecoder::new();
+        let r = d.push(&rest).expect("decodes");
+        assert_eq!(
+            r.out, b"data: one\n",
+            "de-chunked to the BARE event, no framing"
+        );
+        assert!(!r.done, "more events follow");
+    }
+}
