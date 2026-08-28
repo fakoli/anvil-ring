@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anvil-ring"
+version = "0.1.0"
+description = "Outbound-initiated tether that exposes a rented GPU host's model-serving port to the Anvil family (stdlib-only)."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "fakoli" }]
+dependencies = []   # stdlib-only by design (mirrors anvil-events)
+
+[project.optional-dependencies]
+dev = ["pytest", "coverage>=7.6", "jsonschema[format]>=4.23", "ruff==0.11.12"]
+
+[tool.ruff]
+# Explicit rule scope (mirrors anvil-events / anvil-serving practice): do not
+# rely on version-specific default rule sets.
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B"]
+
+# NAMING RULE (operator directive): the executable is `anvil-ring` and is ALWAYS
+# invoked with the anvil- prefix. There is deliberately no bare `ring` entry
+# point and no short alias -- the prefix is the namespace. Do not add one.
+[project.scripts]
+anvil-ring = "anvil_ring.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["anvil_ring*"]
+
+[tool.setuptools.data-files]
+"share/anvil-ring/schemas" = ["schemas/tether-v1.json"]

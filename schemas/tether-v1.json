@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/fakoli/anvil-ring/schemas/tether-v1.json",
+  "title": "anvil-ring tether registration (v1)",
+  "description": "Wire contract for a tether registration record. Draft only -- ADR-0002 (transport) is open, so this is the shape the hub will accept, not a live endpoint.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "tether", "upstream", "observed_at"],
+  "properties": {
+    "protocol": {
+      "type": "string",
+      "const": "anvil-ring/v1",
+      "description": "Explicit version on the wire so an old client fails closed rather than mis-framing."
+    },
+    "tether": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+      "description": "Hub-side stable name. NOT derived from the remote hostname (rentals have arbitrary, sometimes user-supplied hostnames)."
+    },
+    "upstream": {
+      "type": "string",
+      "pattern": "^https?://(127\\.0\\.0\\.1|localhost|\\[::1\\])(:\\d{1,5})?(/.*)?$",
+      "description": "Local-only loopback upstream. Constrained by schema so a tether cannot be asked to proxy a non-local host (I-5: remote side does not describe its own permissions)."
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "lease_expires_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Bounded lifetime, per I-3. A revoked tether must die within one interval, so a lease may not be indefinite."
+    },
+    "agent": {
+      "type": "string",
+      "maxLength": 128,
+      "description": "Client version string, for fleet inventory only. Never used for authZ."
+    }
+  }
+}
