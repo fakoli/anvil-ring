@@ -328,7 +328,6 @@ async fn run_session(
                                     maybe = from_hub.recv(), if !request_side_idle => match maybe {
                                         // Half-close: no more request bytes. Shutdown
                                         // the write half so the engine sees
-                                        // end-of-request, then KEEP reading -- the
                                         // answer is still to come.
                                         //
                                         // MUST precede the write arm: an empty Vec is

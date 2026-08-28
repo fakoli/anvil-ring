@@ -113,6 +113,41 @@ received a frame", the later frames vanish. The pump hands them to the session
 writer channel and `send` reports Ok; the writer reports no error; the peer
 never shows them.
 
+### SECOND MEASUREMENT (later same day) -- this account is also wrong
+
+With one hub and one tether, both freshly started and verified via `ps`, the
+hub's own routing point logged exactly one event for a whole request:
+
+    HUB parse_head ok: bytes=80 rest=""
+
+One DATA frame, the head, no body rest -- and no further DATA frame ever. Yet the
+caller received `A\r\ndata: one\n\r\n0\r\n\r\n`. Those bytes cannot have come from
+the one frame the hub saw. The frame carrying them reached `parse_head` LATER --
+after `Registry::forward`'s `head()` poll exhausted its 200 x 5ms budget (~1s)
+and returned None. In that window `head` goes from None to Some, the response is
+built, and `parse_head`'s `rest` is forwarded as a body chunk. Because the head
+now PRESERVES `transfer-encoding` (the deliberate hop-by-hop fix), hyper re-frames
+`rest`, so the caller sees chunk framing as body: `A\r\n` + one event + `0\r\n`.
+
+So the caller's payload is a stale, timed-out response, not a live stream. Two
+distinct defects, previously conflated:
+
+1. `head()` waits a fixed ~1s. A slow-to-first-byte engine makes every request
+   take this path: it answers with whatever `rest` happens to hold, and the
+   stream is then abandoned. This is the I-11 failure mode wearing a different
+   face -- not fabricating a 200, but fabricating a PARTIAL body and ending it.
+   It should wait for the head unconditionally (bounded by the caller's own
+   timeout / disconnect), not a fixed 1s.
+2. After `rest` is sent once, later frames stop reaching the hub. That part is
+   still unexplained and is what the remaining failing e2e tests exercise.
+
+Proven correct in isolation, so stop re-testing these: `parse_head` returns the
+body after the head with headers ending once (`parse_head_rest_tests`);
+`TunnelBody::poll_next` returns its receiver on both Chunk and Pending; the chunk
+decoder handles every read boundary; standalone proxy streaming delivers all
+events at correct timing; the tether pump reads all four reads and sends exactly
+10 decoded bytes for the coalesced read (`BR` trace).
+
 Two candidate mechanisms remain, and the next run should distinguish them:
 
 1. The pump's `reply` sender is a clone whose receiver is not the one the writer

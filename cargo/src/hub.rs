@@ -31,6 +31,12 @@ use tokio::sync::mpsc;
 
 /// Default lease. Short enough that revocation lands promptly (I-3); long enough
 /// that re-registration is not the dominant cost on a flaky rental link.
+/// Ceiling on pre-head buffered bytes. A status line plus headers is small; a
+/// stream that has not produced a parseable head within this many bytes is not
+/// producing a head at all, and continuing to buffer would grow hub memory on
+/// someone else's behalf.
+pub const MAX_PENDING_HEAD: usize = 64 * 1024;
+
 pub const DEFAULT_LEASE: Duration = Duration::from_secs(15 * 60);
 
 /// How often the hub re-checks revocation and tether idleness.
@@ -94,6 +100,10 @@ pub struct StreamState {
     chunks: Arc<Mutex<Option<mpsc::Receiver<ChunkOrEnd>>>>,
     /// Populated by the first DATA frame that carries a status line.
     pub head: Arc<Mutex<Option<http::Response<()>>>>,
+    /// Engine bytes received before a parseable head. A response head has no
+    /// length prefix, so it may legitimately arrive across two frames; those
+    /// bytes are joined here and retried. Bounded by `MAX_PENDING_HEAD`.
+    pub pending_head: Arc<Mutex<Vec<u8>>>,
     /// Set when the engine's END arrives (see `StreamGuard::drop`).
     pub completed: Arc<AtomicBool>,
 }
@@ -279,6 +289,7 @@ impl Registry {
             chunk_tx,
             chunks: Arc::new(Mutex::new(Some(chunks))),
             head: Arc::new(Mutex::new(None)),
+            pending_head: Arc::new(Mutex::new(Vec::new())),
             completed: Arc::new(AtomicBool::new(false)),
         });
         session.streams.lock().unwrap().insert(id, state.clone());
@@ -777,15 +788,69 @@ async fn handle_tether(
                                 if st.head.lock().unwrap().is_none() {
                                     // The first chunk carries the engine's status
                                     // line; the tether forwarded raw HTTP bytes.
+                                    // Any bytes buffered from an earlier unparsable
+                                    // frame go in FRONT of this one, so a head split
+                                    // across frames is retried as one.
+                                    let buffered =
+                                        std::mem::take(&mut *st.pending_head.lock().unwrap());
+                                    let bytes: Vec<u8> = if buffered.is_empty() {
+                                        bytes.to_vec()
+                                    } else {
+                                        let mut v = buffered;
+                                        v.extend_from_slice(&bytes);
+                                        v
+                                    };
                                     if let Some((res, rest)) = parse_head(&bytes) {
+                                    
                                         *st.head.lock().unwrap() = Some(res);
                                         if !rest.is_empty()
                                             && st.chunks_tx().send(ChunkOrEnd::Chunk(rest)).await.is_err()
                                         {
                                             let _ = sink.send(ws_msg(Frame::End { stream: id, reason: Vec::new() })).await;
                                         }
+                                    } else {
+                                        // NOT a head. The previous version of this
+                                        // branch dropped the chunk and left `head`
+                                        // unset, which meant the NEXT chunk arrived
+                                        // here too and was dropped as well: one
+                                        // unparsable first frame silently killed the
+                                        // whole response, and nothing was logged.
+                                        //
+                                        // Buffer it instead. A head split across two
+                                        // reads is legal -- the status line has no
+                                        // length prefix -- so the two frames are
+                                        // joined and retried on the next chunk.
+                                        // Scoped so the guard is dropped at the
+                                        // block's end: a std MutexGuard is not
+                                        // `Send`, and this loop lives in a future
+                                        // passed to tokio::spawn, so any guard
+                                        // reaching an await makes the whole
+                                        // future non-Send (compile error, not a
+                                        // deadlock -- caught here by cargo).
+                                        let over = {
+                                            let mut p = st.pending_head.lock().unwrap();
+                                            let over = p.len() + bytes.len() > MAX_PENDING_HEAD;
+                                            if !over {
+                                                p.extend_from_slice(&bytes);
+                                            }
+                                            over
+                                        };
+                                        if over {
+                                            // Not a head at any plausible offset.
+                                            // Surface it; do not spin forever.
+                                            eprintln!(
+                                                "anvil-ring hub: stream {id} never produced a parseable head"
+                                            );
+                                            let _ = sink
+                                                .send(ws_msg(Frame::End {
+                                                    stream: id,
+                                                    reason: b"bad upstream head".to_vec(),
+                                                }))
+                                                .await;
+                                        }
                                     }
                                 } else if st.chunks_tx().send(ChunkOrEnd::Chunk(Bytes::from(bytes))).await.is_err() {
+                                
                                     // Caller vanished: close the stream at the tether.
                                     let _ = sink.send(ws_msg(Frame::End { stream: id, reason: Vec::new() })).await;
                                 }
@@ -987,5 +1052,35 @@ mod tests {
         let reg = Registry::new(Duration::ZERO);
         reg.register("r1", "rental", "s1");
         assert!(reg.authorize(b"s1").unwrap().ttl >= Duration::from_secs(5));
+    }
+}
+
+#[cfg(test)]
+mod parse_head_rest_tests {
+    use super::*;
+
+    /// The coalesced shape the tether sends first: status line + headers + the
+    /// first chunk-coded event. `rest` must be the BYTES AFTER THE HEAD, and the
+    /// head must be reported -- not swallowed, not doubled.
+    #[test]
+    fn rest_is_the_body_after_the_head_and_headers_end_once() {
+        let wire = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\na\r\ndata: one\n\r\n";
+        let (res, rest) = parse_head(wire).expect("head should parse");
+        assert_eq!(res.status(), hyper::StatusCode::OK);
+        assert_eq!(
+            rest.as_ref(),
+            b"a\r\ndata: one\n\r\n",
+            "rest must begin exactly at the body, not leak header bytes \
+             nor swallow the body"
+        );
+    }
+
+    /// A lone head (no body yet) must yield an empty rest, so the hub does not
+    /// synthesize a body chunk out of nothing.
+    #[test]
+    fn lone_head_has_empty_rest() {
+        let wire = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
+        let (_res, rest) = parse_head(wire).expect("head should parse");
+        assert!(rest.is_empty(), "lone head must not fabricate body bytes: {rest:?}");
     }
 }
