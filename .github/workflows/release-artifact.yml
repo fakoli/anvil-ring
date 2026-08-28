@@ -20,10 +20,16 @@ on:
   pull_request:
   workflow_dispatch:
 
+# This workflow only reads source and uploads run-scoped artifacts. State that boundary
+# explicitly instead of inheriting a repository default an admin could later widen.
+permissions:
+  contents: read
+
 jobs:
   musl:
     name: static musl build (${{ matrix.arch }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -37,13 +43,13 @@ jobs:
             platform: amd64
             file_arch: x86-64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@85c23e28f7ccc75a9a153d45d385d94a85464876 # 1.85
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: cargo
 
@@ -51,7 +57,7 @@ jobs:
       # image but cannot exec /bin/sh in it (`exec format error`) -- exactly what the
       # first Docker run proved. This is Docker's canonical hosted-runner path;
       # x86_64 stays native and pays no emulation cost.
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         if: matrix.platform == 'arm64'
         with:
           platforms: arm64
@@ -73,7 +79,7 @@ jobs:
           docker run --rm --platform "linux/${{ matrix.platform }}" \
             -v "$PWD/cargo":/src -w /src \
             -v anvil-ring-registry-${{ matrix.arch }}:/usr/local/cargo/registry \
-            rust:1.85-alpine sh -c '
+            rust:1.85-alpine@sha256:4333721398de61f53ccbe53b0b855bcc4bb49e55828e8f652d7a8ac33dd0c118 sh -c '
               set -eu
               apk add --no-cache musl-dev >/dev/null
               rustup target add ${{ matrix.target }} >/dev/null
@@ -115,7 +121,7 @@ jobs:
             esac
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: anvil-ring-${{ matrix.arch }}-unknown-linux-musl
           path: cargo/target/${{ matrix.target }}/release/anvil-ring
@@ -124,44 +130,65 @@ jobs:
   tests:
     name: test suite
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@85c23e28f7ccc75a9a153d45d385d94a85464876 # 1.85
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: cargo
       # --test-threads=1 is load-bearing, not cosmetic: the integration suites
       # bind fixed loopback ports, so concurrent tests collide and fail in ways
       # that read like product defects.
-      - name: Unit tests
+      #
+      # Run EVERY target except the two documented I-6 reds as an ordinary mandatory-
+      # green suite. --no-fail-fast means a regression cannot hide later targets from
+      # the log; unlike the old parser, this command itself must return zero.
+      - name: All tests except the two known-red I-6 probes
         working-directory: cargo
-        run: cargo test --lib --locked
-      - name: Integration tests (serial -- fixed loopback ports)
-        working-directory: cargo
-        # The red I-6 test makes `cargo test` exit non-zero, so the serial run is
-        # allowed to fail here and is asserted precisely below. Do NOT treat
-        # continue-on-error as "green": a real regression must still fail the job,
-        # which the next step enforces by naming the one expected failure.
-        continue-on-error: true
-        run: cargo test --locked -- --test-threads=1 | tee /tmp/integ.log
+        run: |
+          cargo test --locked --no-fail-fast -- \
+            --test-threads=1 \
+            --skip tether_death_midstream_ends_the_caller \
+            --skip caller_terminates_within_the_liveness_window
 
-      - name: Assert only the known-open I-6 test is red
+      # Run each red contract by itself. No `continue-on-error` and no pipe: capture
+      # Cargo's REAL exit code, require 101, require exactly the selected failure, and
+      # require Cargo's completed one-test summary. A fix (rc=0), timeout/signal
+      # (rc=124/137), compile failure (no test line), or a renamed/extra failure all
+      # fail closed.
+      - name: Known-red I-6 — RST caller termination contract
+        working-directory: cargo
         run: |
           set -euo pipefail
-          log=/tmp/integ.log
-          test -s "$log" || { echo "::error::no test output captured"; exit 1; }
-          echo "--- failing tests ---"
-          awk '/^failures:$/{f=1;next} f&&/^ +[a-z]/{print} f&&/^$/{f=0}' "$log" \
-            | sort -u | tee /tmp/failed.txt
-          n=$(grep -c . /tmp/failed.txt || true)
-          # Denominator first: an empty failure list can mean the suite never ran,
-          # which must not read as success.
-          echo "failing tests found: $n"
-          test "$n" -eq 1 || { echo "::error::expected exactly 1 known-red test, got $n"; exit 1; }
-          grep -q 'tether_death_midstream_ends_the_caller' /tmp/failed.txt \
-            || { echo "::error::unexpected failing test (list above)"; exit 1; }
-          # Guard the flip side: if I-6 is ever FIXED, that test going quiet would
-          # also look like success. Force an explicit update to this gate instead.
-          grep -E "^test result: FAILED\. 3 passed; 1 failed" "$log" >/dev/null \
-            || { echo "::error::forward_e2e counts changed; update this gate deliberately"; exit 1; }
-          echo "OK: the single red test is the known-open I-6 defect."
+          log=/tmp/i6-rst.log
+          set +e
+          cargo test --locked --test forward_e2e \
+            tether_death_midstream_ends_the_caller -- --exact --test-threads=1 \
+            >"$log" 2>&1
+          rc=$?
+          set -e
+          cat "$log"
+          test "$rc" -eq 101 \
+            || { echo "::error::expected I-6 red exit 101, got $rc"; exit 1; }
+          test "$(grep -c '^test .* \.\.\. FAILED$' "$log" || true)" -eq 1
+          grep -qx 'test tether_death_midstream_ends_the_caller ... FAILED' "$log"
+          grep -Eq '^test result: FAILED\. 0 passed; 1 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+
+      - name: Known-red I-6 — leaked-socket liveness contract
+        working-directory: cargo
+        run: |
+          set -euo pipefail
+          log=/tmp/i6-liveness.log
+          set +e
+          cargo test --locked --test i6_tether_death_probe \
+            caller_terminates_within_the_liveness_window -- --exact --test-threads=1 \
+            >"$log" 2>&1
+          rc=$?
+          set -e
+          cat "$log"
+          test "$rc" -eq 101 \
+            || { echo "::error::expected I-6 red exit 101, got $rc"; exit 1; }
+          test "$(grep -c '^test .* \.\.\. FAILED$' "$log" || true)" -eq 1
+          grep -qx 'test caller_terminates_within_the_liveness_window ... FAILED' "$log"
+          grep -Eq '^test result: FAILED\. 0 passed; 1 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"

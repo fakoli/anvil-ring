@@ -17,9 +17,7 @@ dependencies = [
  "rustls",
  "sha2",
  "tokio",
- "tokio-rustls",
  "tokio-tungstenite",
- "webpki-roots 1.0.9",
 ]
 
 [[package]]
