@@ -25,6 +25,8 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 webpki-roots = "0.26"
 tokio-rustls = "0.26"
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
+httparse = "1.10.1"
+http-body = "1"
 
 # I-7: one static, self-contained artifact. Build for
 # aarch64-unknown-linux-musl / x86_64-unknown-linux-musl so the binary has no

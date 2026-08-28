@@ -65,6 +65,17 @@ pub struct TunnelState {
     pub lease_secs: AtomicU64,
 }
 
+impl TunnelState {
+    /// Is the tunnel currently authorized and usable?
+    ///
+    /// Named rather than reading `up` directly at call sites: "can I route through
+    /// this tether right now" is the question callers actually have, and it is
+    /// false across every reconnect window (I-6).
+    pub fn is_up(&self) -> bool {
+        self.up.load(Ordering::Acquire)
+    }
+}
+
 pub struct ClientConfig {
     pub hub_url: String,
     pub credential: Vec<u8>,
@@ -149,7 +160,7 @@ fn host_of(url: &str) -> String {
 fn url_is_loopback(url: &str) -> bool {
     let d = host_of(url);
     let h = d.split(':').next().unwrap_or(&d);
-    crate::proxy::is_loopback_host(h) || h.ends_with(".localhost")
+    is_loopback_name_loose(h)
 }
 
 /// Run one tunnel session over an established WebSocket.
@@ -204,7 +215,15 @@ pub async fn serve_over(
     // side, which is how END is implemented.
     let mut streams: HashMap<u16, mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
 
-    let result = run_session(&mut stream, &tx, &mut lease_tick, &mut hb, &mut streams, upstream).await;
+    let result = run_session(
+        &mut stream,
+        &tx,
+        &mut lease_tick,
+        &mut hb,
+        &mut streams,
+        upstream,
+    )
+    .await;
 
     streams.clear();
     drop(tx);
@@ -269,26 +288,168 @@ async fn run_session(
                         // would never come back.
                         tokio::spawn(async move {
                             let mut buf = vec![0u8; ENGINE_READ_BUF];
+                            // Writing toward the engine is finished by a half-close,
+                            // after which further request bytes would fail.
+                            let mut write_closed = false;
+                            // Decode the engine's chunked coding HERE, at the hop that
+                            // owns it. `transfer-encoding` is hop-by-hop and is stripped
+                            // when the response is forwarded, so forwarding chunked
+                            // bytes verbatim would leave the hub to frame an already
+                            // chunk-coded payload -- measured on the wire as a length
+                            // that disagrees with its own data. Empty until the head
+                            // says otherwise.
+                            let mut dechunk: Option<crate::chunked::ChunkedDecoder> = None;
+                            // Set once the engine's response head has been examined.
+                            let mut head_seen = false;
                             loop {
                                 tokio::select! {
                                     biased;
                                     maybe = from_hub.recv() => match maybe {
-                                        Some(bytes) => {
+                                        // Half-close: no more request bytes. Shutdown
+                                        // the write half so the engine sees
+                                        // end-of-request, then KEEP reading -- the
+                                        // answer is still to come.
+                                        //
+                                        // MUST precede the write arm: an empty Vec is
+                                        // the signal, and a `Some(bytes)` catch-all
+                                        // placed first would swallow it and the
+                                        // engine would never see end-of-request.
+                                        Some(bytes) if bytes.is_empty() && !write_closed => {
+                                            if ctx.finish().await.is_err() { break; }
+                                            write_closed = true;
+                                        }
+                                        Some(bytes) if !write_closed => {
                                             if ctx.write(&bytes).await.is_err() { break; }
                                         }
-                                        // Hub sent END (or the stream map dropped us).
-                                        None => { let _ = ctx.finish().await; break; }
+                                        // Request already half-closed and the hub sent
+                                        // more anyway. Ignored rather than written: a
+                                        // write here would error on a shut socket and
+                                        // tear down a stream whose answer is fine.
+                                        Some(_) => {}
+                                        // Hub aborted, or the stream map dropped us.
+                                        None => { break; }
                                     },
                                     n = ctx.read(&mut buf) => match n {
                                         Ok(0) => {
+                                            // Engine EOF. If the body was chunked, the
+                                            // decoder may hold a final flush; a chunk
+                                            // left incomplete is dropped, not forwarded,
+                                            // because a partial SSE event on the wire is
+                                            // indistinguishable from a real one.
+                                            if let Some(d) = dechunk.as_mut() {
+                                                match d.feed_eof() {
+                                                    Ok(rest) if !rest.is_empty() => {
+                                                        let _ = reply.send(msg(Frame::Data { stream: id, bytes: rest }));
+                                                    }
+                                                    Ok(_) => {}
+                                                    Err(e) => {
+                                                        let _ = reply.send(msg(Frame::End {
+                                                            stream: id,
+                                                            reason: format!("truncated chunked body: {e:?}").into_bytes(),
+                                                        }));
+                                                        break;
+                                                    }
+                                                }
+                                            }
                                             let _ = reply.send(msg(Frame::End { stream: id, reason: Vec::new() }));
                                             break;
                                         }
                                         Ok(k) => {
-                                            // One engine read == one DATA frame, sent
-                                            // immediately. Batching here would violate
-                                            // I-9 and show up as slow tokens.
-                                            if reply.send(msg(Frame::Data { stream: id, bytes: buf[..k].to_vec() })).is_err() { break; }
+                                            // Decide on the FIRST read, from the head
+                                            // we already have: only a chunked body gets
+                                            // decoded. A plain content-length body must
+                                            // pass through byte-for-byte, or we would
+                                            // corrupt it by hunting for chunk markers.
+                                            if dechunk.is_none() && !head_seen {
+                                                head_seen = true;
+                                                if let Some((head, body)) = split_head(&buf[..k]) {
+                                                    if crate::chunked::is_chunked(head.headers()) {
+                                                        // Forward the engine's head VERBATIM as
+                                                        // the first DATA frame, THEN the decoded
+                                                        // body separately.
+                                                        //
+                                                        // This is not cosmetic. The hub's session
+                                                        // loop recognises the first chunk by
+                                                        // successfully parsing a status line out of
+                                                        // it, and only then treats later chunks as
+                                                        // body. Sending decoded body first makes
+                                                        // parse_head return None, and the hub's
+                                                        // "not a head yet" branch drops the chunk --
+                                                        // silently, for every chunk of the response.
+                                                        // That was the final link in a chain of four
+                                                        // bugs, all of which presented as "caller
+                                                        // receives an empty 200".
+                                                        let raw_head = buf[..k - body.len()].to_vec();
+                                                        if reply.send(msg(Frame::Data { stream: id, bytes: raw_head })).is_err() { break; }
+                                                        dechunk = Some(crate::chunked::ChunkedDecoder::new());
+                                                        // Decode the WHOLE remainder of
+                                                        // this read, not one chunk.
+                                                        //
+                                                        // An engine that flushes fast (or a
+                                                        // loopback socket coalescing) hands us
+                                                        // head + every event in one read --
+                                                        // measured here as one 95-byte read
+                                                        // containing the entire response. An
+                                                        // earlier version decoded one chunk
+                                                        // and `continue`d, silently discarding
+                                                        // every later event in that same read,
+                                                        // which looked exactly like "streaming
+                                                        // stops after the first token".
+                                                        let mut d = dechunk.take().unwrap();
+                                                        let mut acc: Vec<u8> = Vec::new();
+                                                        // `done` cannot be true here: `body`
+                                                        // is everything after the head in a
+                                                        // read we just took as COMPLETE, so the
+                                                        // last-chunk marker, if present, is in
+                                                        // these bytes -- and if the decoder says
+                                                        // done, we honour it.
+                                                        let done_now;
+                                                        match d.push(&body) {
+                                                            Ok(r) => {
+                                                                acc.extend_from_slice(&r.out);
+                                                                done_now = r.done;
+                                                            }
+                                                            Err(e) => {
+                                                                let _ = reply.send(msg(Frame::End { stream: id, reason: format!("bad chunked body: {e:?}").into_bytes() }));
+                                                                break;
+                                                            }
+                                                        }
+                                                        dechunk = Some(d);
+                                                        if !acc.is_empty() {
+                                                            if reply.send(msg(Frame::Data { stream: id, bytes: acc })).is_err() { break; }
+                                                        }
+                                                        if done_now {
+                                                            // The last-chunk marker was in
+                                                            // this read: the body is finished.
+                                                            let _ = reply.send(msg(Frame::End { stream: id, reason: Vec::new() }));
+                                                            break;
+                                                        }
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                            let payload = match &mut dechunk {
+                                                None => buf[..k].to_vec(),
+                                                Some(d) => match d.push(&buf[..k]) {
+                                                    Ok(r) => r.out,
+                                                    Err(e) => {
+                                                        let _ = reply.send(msg(Frame::End {
+                                                            stream: id,
+                                                            reason: format!("bad chunked body: {e:?}").into_bytes(),
+                                                        }));
+                                                        break;
+                                                    }
+                                                },
+                                            };
+                                            // A chunk boundary can yield zero bytes
+                                            // (e.g. a size line split across reads);
+                                            // sending an empty DATA frame would make
+                                            // the hub emit an empty caller chunk.
+                                            if !payload.is_empty() {
+                                                if reply.send(msg(Frame::Data { stream: id, bytes: payload })).is_err() {
+                                                    break;
+                                                }
+                                            }
                                         }
                                         Err(_) => {
                                             let _ = reply.send(msg(Frame::End { stream: id, reason: b"engine read failed".to_vec() }));
@@ -306,6 +467,13 @@ async fn run_session(
                         // Unknown stream: dropped, not materialized. Either a late
                         // chunk after our END or a peer bug; neither warrants
                         // inventing state.
+                    }
+                    Frame::HalfEnd { stream: id } => {
+                        // Empty slice is the half-close signal to the pump: shutdown
+                        // the write half toward the engine, do NOT stop reading.
+                        if let Some(tx_stream) = streams.get(&id) {
+                            let _ = tx_stream.send(Vec::new());
+                        }
                     }
                     Frame::End { stream: id, .. } => {
                         streams.remove(&id);
@@ -328,20 +496,13 @@ struct StreamCtx {
 
 impl StreamCtx {
     async fn open(head: &[u8], upstream: &str) -> io::Result<Self> {
-        let host = upstream
-            .split("://")
-            .nth(1)
-            .unwrap_or(upstream)
-            .trim_end_matches('/');
-        // Re-checked here, not only at startup, so this path cannot be reached
-        // with a routable target even if a caller changes (I-10).
-        if !crate::proxy::is_loopback_host(host) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("refusing non-loopback upstream {host} (I-10)"),
-            ));
-        }
-        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(host))
+        // Parse-and-validate in one step. Re-checked here, not only at startup, so
+        // this path cannot be reached with a routable target even if configuration
+        // changes (I-10). The earlier version compared an authority *string* to a
+        // host list, so "127.0.0.1:8000" was REFUSED as non-loopback -- an
+        // invariant check that broke the invariant's own purpose.
+        let addr = crate::proxy::loopback_authority(upstream, 80)?;
+        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "engine connect timed out"))??;
         let (r, mut w) = tokio::io::split(tcp);
@@ -360,6 +521,21 @@ impl StreamCtx {
         use tokio::io::AsyncReadExt;
         self.r.read(buf).await
     }
+}
+
+/// Split an engine read into (parsed head, remaining body bytes).
+///
+/// Returns None when the head is not complete yet -- in which case the caller
+/// forwards nothing, since a half-parsed status line is not a response.
+fn split_head(bytes: &[u8]) -> Option<(http::Response<()>, bytes::Bytes)> {
+    // `find_header_end` returns the offset just PAST the blank line, and
+    // `parse_head` returns the remainder from that same offset. Passing
+    // `end + 4` here was a real bug: it started the body four bytes early, so the
+    // chunked decoder received `a\r\ndata...` (the last 2 bytes of the header block
+    // plus the size line) and reported a chunk length that did not match its data.
+    // `find_header_end` is kept for callers that need the boundary, not so it can
+    // be re-applied to a slice parse_head already sliced.
+    crate::hub::parse_head(bytes)
 }
 
 /// Heartbeat state, kept in one struct so the ping cadence, the dead deadline, and
@@ -430,3 +606,17 @@ fn decode(m: &WsMsg) -> Result<Option<Frame>, Box<dyn std::error::Error + Send +
     }
 }
 
+/// Loopback check by NAME (no resolution), for the hub URL only.
+///
+/// Kept separate from `proxy::loopback_authority` on purpose: the engine target is
+/// an address and gets parse+validate+connect in one step, whereas the hub URL here
+/// must permit `localhost`/`.localhost` (RFC 6761 loopback by definition) purely to
+/// decide whether plaintext `ws://` is acceptable for an in-process test. Resolving
+/// a name to make that decision would let a name that resolves off-host through.
+fn is_loopback_name_loose(h: &str) -> bool {
+    if h == "localhost" || h.ends_with(".localhost") {
+        return true;
+    }
+    h.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}

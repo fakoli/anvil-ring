@@ -143,7 +143,13 @@ fn stream_through(res: Response<Incoming>) -> Response<ResBody> {
     out
 }
 
-fn authorized(headers: &hyper::HeaderMap, expected: &str) -> bool {
+/// The single bearer-token check for this crate.
+///
+/// Exported so the hub's frontend and the local proxy cannot drift. A second
+/// implementation is how one of them ends up comparing tokens with `==` on a
+/// non-constant-time path, or forgetting that the scheme is case-sensitive while
+/// the token is not.
+pub fn authorized(headers: &hyper::HeaderMap, expected: &str) -> bool {
     let Some(value) = headers.get(header::AUTHORIZATION) else {
         return false;
     };
@@ -175,25 +181,84 @@ fn forward_uri(upstream: &hyper::Uri, req_uri: &hyper::Uri) -> Option<hyper::Uri
 
 /// The single definition of "loopback" for the whole crate (I-10).
 ///
-/// Both the proxy and the tunnel consult this. Two definitions of a security
-/// boundary is how one of them ends up accepting `0.0.0.0`, `0177.0.0.1`, or a
-/// `*.localhost` name that resolves off-host.
-pub fn is_loopback_host(host: &str) -> bool {
-    let h = host.trim_start_matches('[').trim_end_matches(']');
-    if h == "localhost" || h.ends_with(".localhost") {
-        return true;
+/// Takes an `SocketAddr`, NOT a string, on purpose: callers previously string-split
+/// authority into host themselves, and one of them passed `host:port` here, so a
+/// *legitimate* loopback engine was refused as "non-loopback". Parsing removes that
+/// class of bug instead of documenting around it. A caller that only has an
+/// authority string should use `loopback_authority` (same file, same rules).
+///
+/// Two definitions of a security boundary is how one ends up accepting `0.0.0.0`,
+/// `0177.0.0.1`, or a `*.localhost` name that resolves off-host.
+pub fn is_loopback_addr(addr: &std::net::SocketAddr) -> bool {
+    // `0.0.0.0` is NOT loopback: on Linux it is a bind-any wildcard, and
+    // connecting through it is a routable connection.
+    addr.ip().is_loopback()
+}
+
+/// Validate an `authority` (`host[:port]`, or a bare host) as loopback, returning
+/// the address to connect to.
+///
+/// `default_port` is used only when the authority omits one.
+///
+/// Deliberately *no* DNS: a hostname is refused rather than resolved. A name that
+/// resolves off-host (or is later re-pointed) would turn "loopback only" into a
+/// routable connection, and resolving it here would make that invisible. Callers
+/// that genuinely want `localhost` pass it as a literal, which resolves via the
+/// OS to 127.0.0.1/::1 through the same `to_socket_addrs` path as everything else.
+pub fn loopback_authority(
+    authority: &str,
+    default_port: u16,
+) -> std::io::Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    // Trim any scheme prefix so callers cannot smuggle one in here, and reject
+    // anything path-shaped -- an authority must not contain '/'.
+    let authority = authority.split("://").nth(1).unwrap_or(authority);
+    let authority = authority.split('/').next().unwrap_or(authority);
+    if authority.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty upstream authority",
+        ));
     }
-    match h.parse::<std::net::IpAddr>() {
-        // `0.0.0.0` is NOT loopback: on Linux it is a bind-any wildcard, and
-        // connecting through it is a routable connection.
-        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
-        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
-        Err(_) => false,
+    // `:port` already present -> parse as-is; otherwise append the default.
+    let candidate = if authority.rsplit_once(']').is_some() || authority.matches(':').count() > 1 {
+        // bracketed IPv6 or bare IPv6: no port given
+        format!(
+            "[{}]:{default_port}",
+            authority.trim_matches(|c| c == '[' || c == ']')
+        )
+    } else if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{authority}:{default_port}")
+    };
+    let addr = candidate
+        .to_socket_addrs()
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("bad upstream authority {authority}: {e}"),
+            )
+        })?
+        .next()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("no address for {authority}"),
+            )
+        })?;
+    if !is_loopback_addr(&addr) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing non-loopback upstream {addr} (I-10)"),
+        ));
     }
+    Ok(addr)
 }
 
 fn is_loopback(uri: &hyper::Uri) -> bool {
-    uri.host().is_some_and(is_loopback_host)
+    uri.host()
+        .is_some_and(|h| matches!(loopback_authority(h, 0), Ok(_)))
 }
 
 async fn connect_loopback(host: &str) -> std::io::Result<TcpStream> {

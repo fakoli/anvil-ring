@@ -19,7 +19,11 @@
 
 use crate::frames::Frame;
 use futures_util::{SinkExt, StreamExt};
-use std::collections::HashMap;
+use http::Method;
+use hyper::body::Bytes;
+use hyper::header::{HeaderMap, HeaderName, HeaderValue};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
@@ -55,16 +59,50 @@ pub struct Lease {
     pub ttl: Duration,
 }
 
-/// Live session handle, so revocation can reach an established tunnel.
+/// A live session handle, so both revocation (I-3) and request forwarding (the
+/// hub -> tether direction) can reach an established tunnel.
 #[derive(Clone)]
 struct LiveSession {
-    /// Held, never written through directly: dropping this sender (when the
-    /// registry evicts the session on revoke) is what makes the session task's
-    /// `rx.recv()` return `None` and tear the tunnel down (I-3). The field looks
-    /// unused to the compiler and is not.
-    #[allow(dead_code)]
+    /// Write half. Requests the hub originates are pushed here and the session
+    /// loop puts them on the wire.
     tx: mpsc::UnboundedSender<Frame>,
     last_seen: Arc<Mutex<Instant>>,
+    /// Open streams on this tether, so the session loop can route inbound
+    /// DATA/END frames to the caller waiting on the other end.
+    streams: Arc<Mutex<HashMap<u16, Arc<StreamState>>>>,
+    /// Hands out stream ids for this tether. Per-tether so ids never collide
+    /// across tethers, and monotonic so reuse cannot silently alias a live stream.
+    next_id: Arc<Mutex<u32>>,
+}
+
+/// One in-flight proxied stream. The hub-side twin of the client's `StreamCtx`.
+pub struct StreamState {
+    pub method: Method,
+    pub path: String,
+    pub headers: HeaderMap,
+    /// Body bytes waiting to be pushed. Held so a caller streaming a long prompt
+    /// cannot outrun the tunnel (backpressure), rather than buffering unbounded.
+    pub pending: Arc<Mutex<VecDeque<u8>>>,
+    /// Response side. Bounded, so a chatty engine cannot grow hub memory without
+    /// limit if the caller stops reading.
+    /// Sender kept so the session task can push engine bytes; `chunks` is the
+    /// half the caller reads.
+    chunk_tx: mpsc::Sender<ChunkOrEnd>,
+    /// A plain `std` mutex: the frontend *takes* the receiver for one poll and
+    /// releases the lock before touching it, so no guard ever crosses an await.
+    /// (A tokio mutex here was tried first and made `poll` unwieldy for no gain.)
+    chunks: Arc<Mutex<Option<mpsc::Receiver<ChunkOrEnd>>>>,
+    /// Populated by the first DATA frame that carries a status line.
+    pub head: Arc<Mutex<Option<http::Response<()>>>>,
+    /// Set when the engine's END arrives (see `StreamGuard::drop`).
+    pub completed: Arc<AtomicBool>,
+}
+
+/// A response-side event for one stream.
+#[derive(Debug)]
+pub enum ChunkOrEnd {
+    Chunk(Bytes),
+    End,
 }
 
 /// The hub's authority. Cloned cheaply and shared between the accept loop and the
@@ -123,7 +161,12 @@ impl Registry {
     /// THE authorization decision (I-5). Takes only a credential: a client cannot
     /// request a port, a host, a rate, or a longer lease.
     pub fn authorize(&self, credential: &[u8]) -> Option<Lease> {
-        let id = self.by_credential.lock().unwrap().get(&digest(credential))?.clone();
+        let id = self
+            .by_credential
+            .lock()
+            .unwrap()
+            .get(&digest(credential))?
+            .clone();
         let tether = self.by_id.lock().unwrap().get(&id)?.clone();
         // Revoked == nonexistent, and deliberately indistinguishable from it: a
         // client learning "you were revoked" is a (mild) oracle it does not need.
@@ -161,20 +204,146 @@ impl Registry {
         changed
     }
 
-    fn attach(&self, id: &str, tx: mpsc::UnboundedSender<Frame>) -> Arc<Mutex<Instant>> {
-        let seen = Arc::new(Mutex::new(Instant::now()));
-        self.live.lock().unwrap().insert(
-            id.to_string(),
-            LiveSession {
-                tx,
-                last_seen: seen.clone(),
-            },
-        );
-        seen
+    fn attach(&self, id: &str, tx: mpsc::UnboundedSender<Frame>) -> LiveSession {
+        let session = LiveSession {
+            tx,
+            last_seen: Arc::new(Mutex::new(Instant::now())),
+            streams: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(Mutex::new(1)),
+        };
+        self.live
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), session.clone());
+        session
     }
 
     fn detach(&self, id: &str) {
         self.live.lock().unwrap().remove(id);
+    }
+
+    /// Forward a caller's request through a tether's tunnel and return a reader
+    /// for the engine's streaming answer.
+    ///
+    /// This is the hub's only path to a tether, and it is deliberately *not*
+    /// exposed to the tether side (I-5): the hub chooses which tether serves a
+    /// request, and a tether cannot ask to originate anything.
+    pub async fn forward(
+        &self,
+        tether_id: &str,
+        req: http::Request<hyper::body::Incoming>,
+    ) -> Result<Forwarded, ForwardError> {
+        let session = self
+            .live
+            .lock()
+            .unwrap()
+            .get(tether_id)
+            .cloned()
+            .ok_or(ForwardError::NoTether)?;
+        if !self.is_active(tether_id) {
+            // A tether can be revoked between the registry check and here; never
+            // route to a revoked one even if its socket still looks live (I-3).
+            return Err(ForwardError::Revoked);
+        }
+
+        // Stream ids are u16 and per-tether. Wrapping is refused rather than
+        // silently reused: reassigning an id that a live stream still holds would
+        // deliver one caller's tokens to another.
+        let id = {
+            let mut next = session.next_id.lock().unwrap();
+            if *next > u32::from(u16::MAX) {
+                return Err(ForwardError::Idhausted);
+            }
+            let id = *next as u16;
+            *next += 1;
+            id
+        };
+
+        let (method, path, headers, mut body) = {
+            let parts = req.method().clone();
+            let path = req
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string());
+            let headers = req.headers().clone();
+            (parts, path, headers, req.into_body())
+        };
+
+        let (chunk_tx, chunks) = mpsc::channel::<ChunkOrEnd>(64);
+        let state = Arc::new(StreamState {
+            method,
+            path,
+            headers,
+            pending: Arc::new(Mutex::new(VecDeque::new())),
+            chunk_tx,
+            chunks: Arc::new(Mutex::new(Some(chunks))),
+            head: Arc::new(Mutex::new(None)),
+            completed: Arc::new(AtomicBool::new(false)),
+        });
+        session.streams.lock().unwrap().insert(id, state.clone());
+
+        // Emit OPEN. From here on, every exit path must close the stream, or a
+        // failed forward leaves a phantom entry that a later END would resurrect.
+        let open = {
+            // Encode the request head. Getting this wrong is invisible in a test
+            // that only checks "did bytes come back" -- an empty head still yields
+            // *some* engine response -- so the shape is asserted directly in
+            // `request_head_is_a_valid_http_request`.
+            let head = encode_request_head(&state.method, &state.path, &state.headers);
+            Frame::Open { stream: id, head }
+        };
+        if session.tx.send(open).is_err() {
+            session.streams.lock().unwrap().remove(&id);
+            return Err(ForwardError::TetherGone);
+        }
+        // Drop guard: if this function returns Err after OPEN or the caller drops
+        // the reader without finishing, the tether must be told.
+        let _guard = StreamGuard {
+            tx: session.tx.clone(),
+            streams: session.streams.clone(),
+            id,
+            chunk_tx: state.chunk_tx.clone(),
+            completed: state.completed.clone(),
+        };
+
+        // Drain the caller's body into the tunnel as DATA frames. Doing this on the
+        // calling task means the caller's backpressure is the tunnel's backpressure
+        // -- no unbounded buffer for a long prompt.
+        // Incoming implements http_body::Body, not futures::Stream; BodyExt::frame
+        // is the accessor that works for it in hyper 1.
+        use http_body_util::BodyExt;
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|_| ForwardError::CallerBody)?;
+            if frame.is_trailers() {
+                continue;
+            }
+            let chunk = frame.into_data().map_err(|_| ForwardError::CallerBody)?;
+            session
+                .tx
+                .send(Frame::Data {
+                    stream: id,
+                    bytes: chunk.to_vec(),
+                })
+                .map_err(|_| ForwardError::TetherGone)?;
+        }
+        // HALF_END, not END.
+        //
+        // The head we forwarded declares neither `transfer-encoding: chunked` nor a
+        // `content-length` we could vouch for, because the body arrives later as DATA
+        // frames. So only a half-close toward the engine can end the request while
+        // leaving the answer flowing back.
+        //
+        // Sending END here -- as an earlier version did -- produced a *valid but
+        // empty* engine request: the tether shut its write half before any DATA
+        // reached it, and vLLM would have hung on a body it never saw or answered a
+        // zero-byte prompt. The failure was silent because what came back parsed fine.
+        session
+            .tx
+            .send(Frame::HalfEnd { stream: id })
+            .map_err(|_| ForwardError::TetherGone)?;
+
+        Ok(Forwarded { id, state, _guard })
     }
 
     /// Is the tether up, down, or absent? (I-6: never "maybe slow".)
@@ -218,6 +387,199 @@ pub enum TetherState {
     Stale(Duration),
     /// Registered, not currently connected.
     Down,
+}
+
+/// Why a request could not be forwarded. Each variant is a distinct operator
+/// answer -- "no tether" and "revoked" must not be conflated, or a revoked node
+/// reads as a merely-absent one (I-3/I-6).
+#[derive(Debug)]
+pub enum ForwardError {
+    /// No live tunnel for that tether.
+    NoTether,
+    /// Tether is registered but revoked; refuse even though its socket may live.
+    Revoked,
+    /// 65535 streams opened on one tunnel without reuse. Refuse; do not alias.
+    Idhausted,
+    /// The tunnel died mid-forward.
+    TetherGone,
+    /// The caller's own body failed.
+    CallerBody,
+}
+
+impl std::fmt::Display for ForwardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ForwardError::NoTether => "no live tunnel for this tether",
+            ForwardError::Revoked => "tether revoked",
+            ForwardError::Idhausted => "too many concurrent streams on this tether",
+            ForwardError::TetherGone => "tunnel closed mid-request",
+            ForwardError::CallerBody => "caller body read failed",
+        })
+    }
+}
+
+impl std::error::Error for ForwardError {}
+
+/// A forwarded stream, handed back to the caller-facing frontend.
+///
+/// No Debug: it holds stream state containing channels, and a debug print of that
+/// would tempt someone into logging request bodies.
+pub struct StreamGuard {
+    tx: mpsc::UnboundedSender<Frame>,
+    streams: Arc<Mutex<HashMap<u16, Arc<StreamState>>>>,
+    id: u16,
+    #[allow(dead_code)]
+    chunk_tx: mpsc::Sender<ChunkOrEnd>,
+    /// Set when the answer reaches END, so Drop knows not to abort.
+    ///
+    /// Read in `StreamGuard::drop`; annotated because the compiler cannot see a
+    /// read that lives in a Drop impl for this type's own field.
+    #[allow(dead_code)]
+    completed: Arc<AtomicBool>,
+}
+
+impl Drop for StreamGuard {
+    /// Tells the tether to abort, and unregisters the stream, so an abandoned
+    /// caller cannot leave a half-open stream consuming engine capacity. The
+    /// channel sender drop also wakes anyone awaiting chunks.
+    fn drop(&mut self) {
+        self.streams.lock().unwrap().remove(&self.id);
+        let _ = self.tx.send(Frame::End {
+            stream: self.id,
+            reason: Vec::new(),
+        });
+    }
+}
+
+/// The caller-facing handle: yields engine response chunks until END.
+pub struct Forwarded {
+    pub id: u16,
+    state: Arc<StreamState>,
+    _guard: StreamGuard,
+}
+
+impl Forwarded {
+    /// The engine's status line and headers, as soon as they arrive. The tether
+    /// parses them out of the first DATA frame; a proxy that only looked at the
+    /// body could not distinguish an engine 500 from an engine 200.
+    pub async fn head(&self) -> Option<http::Response<()>> {
+        // The head is written by the session task between DATA frames, so poll for
+        // it rather than assuming it is present on first read.
+        for _ in 0..200 {
+            if let Some(res) = self.state.head.lock().unwrap().clone() {
+                return Some(res);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        None
+    }
+
+    /// Hand the response receiver to the caller-facing frontend, which becomes its
+    /// sole owner. Returns None if already handed over.
+    pub fn take_rx(&self) -> Option<mpsc::Receiver<ChunkOrEnd>> {
+        self.state.chunks.lock().unwrap().take()
+    }
+}
+
+impl StreamState {
+    /// Handle the session task uses to deliver engine bytes to this stream.
+    pub fn chunks_tx(&self) -> mpsc::Sender<ChunkOrEnd> {
+        self.chunk_tx.clone()
+    }
+}
+
+/// Serialize an HTTP/1.1 request line + headers, for an OPEN frame's `head`.
+///
+/// Mirrors `parse_head` on the response side. Two rules that are easy to get wrong
+/// and produce "works against my test server, breaks against vLLM":
+///  - Host is required by HTTP/1.1 but was stripped as hop-by-hop on the way in, so
+///    it is re-derived from the upstream authority rather than forwarded.
+///  - `content-length` must reflect the body the tether will actually send. We know
+///    it only after draining, so it is deliberately omitted and the stream is
+///    self-terminating via END; engines accept chunked/EOF-delimited bodies, and
+///    inventing a wrong length is worse than omitting one.
+fn encode_request_head(method: &Method, path: &str, headers: &HeaderMap) -> Vec<u8> {
+    let mut out = format!("{method} {path} HTTP/1.1\r\n").into_bytes();
+    for (name, value) in headers {
+        if crate::headers::is_hop_by_hop(name.as_str()) {
+            continue;
+        }
+        out.extend_from_slice(name.as_str().as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// Parse an HTTP/1 status line + headers from the first engine bytes, returning
+/// the response head and the unconsumed remainder.
+///
+/// The tether forwards raw engine bytes, so the hub must find the head itself. A
+/// proxy that skipped this could not tell an engine 500 from a 200 -- it would
+/// report both to the caller as a successful stream.
+///
+/// Hand-parsed rather than via a parser crate: a status line is three whitespace
+/// tokens and a header block is `name: value` lines. Pulling httparse in would
+/// mean declaring a dependency that is already in the tree transitively, for less
+/// than 30 lines.
+///
+/// Headers are returned EXACTLY as the engine sent them. This function must NOT
+/// apply hop-by-hop filtering: it parses the engine->tether message, and
+/// `transfer-encoding` is precisely the header that tells the tether how to decode
+/// the body (chunked vs not). An earlier version filtered here because
+/// `headers::ALWAYS_STRIP` is also correct for the *forwarding* path, and the two
+/// paths shared one function. The observable failure was subtle and total: a
+/// response literally declaring `transfer-encoding: chunked` parsed as if it did
+/// not, so the tether never de-chunked, chunk markers were forwarded as payload,
+/// and the hub re-framed an already-chunked body -- producing a chunk length that
+/// disagreed with its own data.
+///
+/// Filtering belongs in `frontend`/`encode_request_head`, on the message that
+/// crosses to the next hop.
+pub fn parse_head(bytes: &[u8]) -> Option<(http::Response<()>, Bytes)> {
+    let end = find_header_end(bytes)?;
+    let head = std::str::from_utf8(&bytes[..end]).ok()?;
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next()?;
+    let mut it = status_line.split_whitespace();
+    let _version = it.next()?;
+    let code: u16 = it.next()?.parse().ok()?;
+    let mut builder = http::Response::builder().status(code);
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let (name, value) = line.split_once(':')?;
+        if let (Ok(n), Ok(v)) = (
+            HeaderName::from_bytes(name.trim().as_bytes()),
+            HeaderValue::from_bytes(value.trim().as_bytes()),
+        ) {
+            builder = builder.header(n, v);
+        }
+    }
+    Some((
+        builder.body(()).ok()?,
+        // `find_header_end` returns the offset just PAST the blank line, so this is
+        // the body proper.
+        Bytes::copy_from_slice(&bytes[end..]),
+    ))
+}
+
+/// Byte offset just past the head (including the blank line), if present.
+pub fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    if let Some(i) = find_subslice(bytes, b"\r\n\r\n") {
+        return Some(i + 4);
+    }
+    if let Some(i) = find_subslice(bytes, b"\n\n") {
+        return Some(i + 2);
+    }
+    None
+}
+
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Accept tunnels. `router` receives a channel for each authorized tether so
@@ -290,7 +652,11 @@ async fn handle_tether(
     let Some(lease) = registry.authorize(&credential) else {
         // Do not say why (see `authorize`). Log the peer, never the credential.
         eprintln!("anvil-ring hub: refused tether from {peer}");
-        let _ = sink.send(ws_msg(Frame::GoAway { reason: b"unauthorized".to_vec() })).await;
+        let _ = sink
+            .send(ws_msg(Frame::GoAway {
+                reason: b"unauthorized".to_vec(),
+            }))
+            .await;
         return Err("unauthorized".into());
     };
 
@@ -299,17 +665,25 @@ async fn handle_tether(
         lease.tether_id,
         lease.ttl.as_secs()
     );
-    sink.send(ws_msg(Frame::Welcome { lease_secs: lease.ttl.as_secs() }))
-        .await?;
-    let _ = events.send(TetherEvent { tether_id: lease.tether_id.clone(), kind: EventKind::Up });
+    sink.send(ws_msg(Frame::Welcome {
+        lease_secs: lease.ttl.as_secs(),
+    }))
+    .await?;
+    let _ = events.send(TetherEvent {
+        tether_id: lease.tether_id.clone(),
+        kind: EventKind::Up,
+    });
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
-    let last_seen = registry.attach(&lease.tether_id, tx);
+    let session = registry.attach(&lease.tether_id, tx);
+    let last_seen = session.last_seen.clone();
+    let streams = session.streams.clone();
     // Boxed+pinned sleep, re-armed each pass: `select!` needs to poll it while we
     // still need to move it. A `tick()` future would hold `interval` borrowed.
     let mut tick = Box::pin(tokio::time::sleep(TETHER_TICK));
     let mut revoked = false;
 
+    // Trace the writer arm: does a frame handed to rx actually reach the socket?
     let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = loop {
         tokio::select! {
             _ = tick.as_mut() => {
@@ -376,13 +750,57 @@ async fn handle_tether(
                     Frame::Open { .. } => {
                         break Err("client sent OPEN; only the hub initiates streams (I-5)".into());
                     }
+                    // Only the hub may half-close: a tether signalling
+                    // end-of-request would be a tether answering a request it was
+                    // never sent. Treated like OPEN, as a protocol violation.
+                    Frame::HalfEnd { .. } => {
+                        break Err("client sent HALF_END; only the hub half-closes (I-5)".into());
+                    }
                     Frame::Hello { .. } | Frame::Welcome { .. } => {
                         break Err("unexpected HELLO/WELCOME mid-session".into());
                     }
-                    Frame::Data { .. } | Frame::End { .. } => {
-                        // Dropped when unowned: fabricating a stream from them
-                        // would let a tether inject bytes into a request it never
-                        // saw.
+                    Frame::Data { stream: id, bytes } => {
+                        // Route only to a stream the HUB opened. Dropping anything
+                        // else is what stops a tether injecting bytes into a
+                        // request it never saw.
+                        // Clone the Arc out so the std guard drops before the
+                        // awaits below; holding it across an await makes the
+                        // session future non-Send.
+                        let target = streams.lock().unwrap().get(&id).cloned();
+                        match target {
+                            None => {
+                                // No such stream: the caller already gave up. Tell
+                                // the tether so it can stop streaming to us.
+                                let _ = sink.send(ws_msg(Frame::End { stream: id, reason: Vec::new() })).await;
+                            }
+                            Some(st) => {
+                                if st.head.lock().unwrap().is_none() {
+                                    // The first chunk carries the engine's status
+                                    // line; the tether forwarded raw HTTP bytes.
+                                    if let Some((res, rest)) = parse_head(&bytes) {
+                                        *st.head.lock().unwrap() = Some(res);
+                                        if !rest.is_empty()
+                                            && st.chunks_tx().send(ChunkOrEnd::Chunk(rest)).await.is_err()
+                                        {
+                                            let _ = sink.send(ws_msg(Frame::End { stream: id, reason: Vec::new() })).await;
+                                        }
+                                    }
+                                } else if st.chunks_tx().send(ChunkOrEnd::Chunk(Bytes::from(bytes))).await.is_err() {
+                                    // Caller vanished: close the stream at the tether.
+                                    let _ = sink.send(ws_msg(Frame::End { stream: id, reason: Vec::new() })).await;
+                                }
+                            }
+                        }
+                    }
+                    Frame::End { stream: id, .. } => {
+                        let target = streams.lock().unwrap().get(&id).cloned();
+                        if let Some(st) = target {
+                            // Mark completed BEFORE the guard can observe the drop,
+                            // so a normal end never turns into an abort.
+                            st.completed.store(true, Ordering::Release);
+                            let _ = st.chunks_tx().send(ChunkOrEnd::End).await;
+                            streams.lock().unwrap().remove(&id);
+                        }
                     }
                 }
             }
@@ -390,8 +808,15 @@ async fn handle_tether(
     };
 
     registry.detach(&lease.tether_id);
-    let kind = if revoked { EventKind::Revoked } else { EventKind::Down };
-    let _ = events.send(TetherEvent { tether_id: lease.tether_id.clone(), kind });
+    let kind = if revoked {
+        EventKind::Revoked
+    } else {
+        EventKind::Down
+    };
+    let _ = events.send(TetherEvent {
+        tether_id: lease.tether_id.clone(),
+        kind,
+    });
     result
 }
 

@@ -139,8 +139,8 @@ async fn run_hub() -> Result<(), Box<dyn std::error::Error>> {
     use anvil_ring::hub::{self, Registry};
     use std::sync::Arc;
 
-    let listen = std::env::var("ANVIL_RING_HUB_LISTEN")
-        .unwrap_or_else(|_| "127.0.0.1:8443".to_string());
+    let listen =
+        std::env::var("ANVIL_RING_HUB_LISTEN").unwrap_or_else(|_| "127.0.0.1:8443".to_string());
     let addr: std::net::SocketAddr = listen.parse()?;
     let cred = std::env::var("ANVIL_RING_DEMO_CREDENTIAL")
         .map_err(|_| "ANVIL_RING_DEMO_CREDENTIAL must name the one tether to register")?;
@@ -155,6 +155,27 @@ async fn run_hub() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut events = hub::serve(addr, reg.clone()).await?;
+
+    // The caller-facing frontend. Without this the binary authenticates tethers and
+    // can authorize them, but nothing can actually be *served* -- `hub` alone would
+    // be a control plane with no data plane. Read from env here so the e2e test
+    // (which calls frontend::serve_frontend directly) and the shipped binary exercise
+    // the same code path; a test that reaches code the binary cannot reach is not
+    // testing the product.
+    if let Ok(front) = std::env::var("ANVIL_RING_FRONTEND_LISTEN") {
+        let faddr: std::net::SocketAddr = front.parse()?;
+        let token = std::env::var("ANVIL_RING_CALLER_TOKEN").map_err(|_| {
+            "ANVIL_RING_CALLER_TOKEN is required when ANVIL_RING_FRONTEND_LISTEN is set"
+        })?;
+        let freg = reg.clone();
+        tokio::spawn(async move {
+            if let Err(e) = anvil_ring::frontend::serve_frontend(faddr, freg, token).await {
+                eprintln!("{PROG}: frontend failed: {e}");
+            }
+        });
+        eprintln!("{PROG}: frontend on {faddr} (callers authenticate with a bearer token)");
+    }
+
     tokio::spawn(async move {
         // Events exist so a lost/revoked tether is a logged state transition (I-6)
         // rather than an absence of evidence. recv() is inherent to the receiver,
@@ -190,17 +211,15 @@ async fn run_tether() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
     // Credential from env/file only -- never argv (I-8).
     let credential = ClientConfig::credential_from_env()?;
-    if !anvil_ring::proxy::is_loopback_host(
-        upstream
-            .split("://")
-            .nth(1)
-            .unwrap_or(&upstream)
-            .split(':')
-            .next()
-            .unwrap_or(""),
-    ) {
-        return Err("upstream must be loopback; the tether only ever proxies locally (I-10)".into());
-    }
+    // Fail fast at startup with a clear message; the per-stream path re-validates.
+    // Parsing (rather than string-comparing) is what makes `127.0.0.1:8000` pass --
+    // the earlier string check refused exactly that legitimate loopback engine.
+    anvil_ring::proxy::loopback_authority(&upstream, 80).map_err(
+        |e| -> Box<dyn std::error::Error> {
+            format!("upstream must be loopback; the tether only ever proxies locally (I-10): {e}")
+                .into()
+        },
+    )?;
 
     let state = Arc::new(TunnelState::default());
     let cfg = ClientConfig {

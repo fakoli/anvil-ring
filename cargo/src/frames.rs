@@ -47,6 +47,10 @@ pub const T_END: u8 = 0x05;
 pub const T_PING: u8 = 0x06;
 pub const T_PONG: u8 = 0x07;
 pub const T_GOAWAY: u8 = 0x08;
+/// Request body is complete; the peer must half-close toward the engine and keep
+/// streaming the answer. Distinct from END ("I am gone"), because aborting a
+/// request and finishing one both happen, and conflating them truncates the answer.
+pub const T_HALF_END: u8 = 0x09;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -68,6 +72,10 @@ pub enum Frame {
         stream: u16,
         reason: Vec<u8>,
     },
+    /// Request-side half-close: no more request bytes, answer still expected.
+    HalfEnd {
+        stream: u16,
+    },
     Ping,
     Pong,
     GoAway {
@@ -86,14 +94,15 @@ impl Frame {
             Frame::Ping => T_PING,
             Frame::Pong => T_PONG,
             Frame::GoAway { .. } => T_GOAWAY,
+            Frame::HalfEnd { .. } => T_HALF_END,
         }
     }
 
     pub fn stream(&self) -> u16 {
         match self {
-            Frame::Open { stream, .. }
-            | Frame::Data { stream, .. }
-            | Frame::End { stream, .. } => *stream,
+            Frame::Open { stream, .. } | Frame::Data { stream, .. } | Frame::End { stream, .. } => {
+                *stream
+            }
             _ => 0,
         }
     }
@@ -111,6 +120,9 @@ impl Frame {
             }
             Frame::Open { stream, head } => (head, *stream),
             Frame::Data { stream, bytes } => (bytes, *stream),
+            // No payload: the stream id already rides in the header, so HalfEnd is
+            // the generic 7-byte frame with an empty body.
+            Frame::HalfEnd { stream } => (&[][..], *stream),
             Frame::End { stream, reason } => (reason, *stream),
             Frame::Ping | Frame::Pong => (&[][..], 0),
             Frame::GoAway { reason } => (reason, 0),
@@ -158,6 +170,14 @@ impl Frame {
                 stream,
                 bytes: payload.to_vec(),
             },
+            T_HALF_END => {
+                if !payload.is_empty() {
+                    // A payload here means a peer invented bytes for a fixed-shape
+                    // frame; refusing beats silently ignoring them.
+                    return Err(FrameError::Malformed("HALF_END must be empty"));
+                }
+                Frame::HalfEnd { stream }
+            }
             T_END => Frame::End {
                 stream,
                 reason: payload.to_vec(),
@@ -173,10 +193,16 @@ impl Frame {
         // a second meaning onto a data stream.
         if matches!(
             frame,
-            Frame::Hello { .. } | Frame::Welcome { .. } | Frame::Ping | Frame::Pong | Frame::GoAway { .. }
+            Frame::Hello { .. }
+                | Frame::Welcome { .. }
+                | Frame::Ping
+                | Frame::Pong
+                | Frame::GoAway { .. }
         ) && stream != 0
         {
-            return Err(FrameError::Malformed("control frame with nonzero stream id"));
+            return Err(FrameError::Malformed(
+                "control frame with nonzero stream id",
+            ));
         }
         Ok(Some((frame, total)))
     }
@@ -297,10 +323,7 @@ mod tests {
         // A PING that says it belongs to stream 5 is either a bug or a smuggle.
         let mut buf = vec![T_PING, 0, 5, 0, 0, 0, 0];
         buf.extend_from_slice(b"");
-        assert!(matches!(
-            Frame::decode(&buf),
-            Err(FrameError::Malformed(_))
-        ));
+        assert!(matches!(Frame::decode(&buf), Err(FrameError::Malformed(_))));
     }
 
     #[test]

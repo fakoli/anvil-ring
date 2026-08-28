@@ -1,80 +1,93 @@
 # STATE
 
 **Last updated:** 2026-08-28
-**Phase:** tunnel + hub + client implemented and **verified end-to-end on one
-machine**. Revocation verified at the authorization layer. **The hub cannot yet
-forward a live request** — see "What is NOT done".
+**Phase:** control plane and data plane are both implemented. The data plane
+forwards and streams, but **does not yet deliver a full multi-event response
+through the tunnel.** Not production-ready.
 
-## Components
+## Verified working (observed on real processes, not asserted in a test)
 
-| Component | File | Verified |
-|---|---|---|
-| Flushing reverse proxy | `cargo/src/proxy.rs` | 9 unit + 5 e2e; TCP-level flush timing |
-| Wire frame codec | `cargo/src/frames.rs` | 9 unit tests, incl. all 8 frame types |
-| Tunnel client (rental side) | `cargo/src/tunnel.rs` | live handshake, lease, state machine |
-| Hub + registry (authority) | `cargo/src/hub.rs` | 11 unit tests, incl. SHA-256 known-answer tests |
-| `anvil-ring hub` / `tether` | `cargo/src/main.rs` | ran both binaries, real WSS |
+1. **Handshake / authorization.** `tether` dials `hub`, presents a credential,
+   receives a WELCOME lease. Hub logs `tether demo-1 authorized; lease 900s`.
 
-`cargo test`: **41 passing**, zero warnings.
+2. **I-1 (thesis) on the OS.** The tether owns exactly one socket and it is
+   outbound (`lsof -nP -a -p <pid> -i`): no listener, ever. The hub has one.
 
-## What was actually observed (not asserted)
+3. **I-10.** Non-loopback upstream refused at startup *and* per stream.
 
-Two real processes, real WebSocket:
+4. **Standalone proxy streams (I-9), through the new chunk decoder.** Four reads
+   at 0.003 / 0.454 / 0.903 / 1.279 s against an engine emitting one event per
+   300 ms, payload `data: one`, `data: two`, `data: done`. Streaming is real.
 
-```
-hub:    hub on 127.0.0.1:18900; tether demo-1 registered (cred 3316c9a97a9a...)
-hub:    tether demo-1 authorized from 127.0.0.1:49288, lease 900s
-hub:    event demo-1 Up
-tether: tunnel #1 authorized; lease 900s
-```
+5. **Chunk decoding engages correctly.** Tether-side trace showed the engine's
+   `transfer-encoding: chunked` detected and each event de-chunked.
 
-Invariants checked against the live processes:
+6. **Caller auth is enforced before tunnel use** (401, and the tunnel is never
+   touched); a live caller with no tether gets 502, not 401.
 
-- **I-1 (outbound only)** — the tether owns **exactly one** socket, and it is
-  outbound: `anvil-rin 37433 TCP 127.0.0.1:49288->127.0.0.1:18900 (ESTABLISHED)`.
-  Zero listeners. The hub, by contrast, shows its `LISTEN`.
-- **I-8 (no secret in argv/logs)** — credential passed by env, absent from `ps`;
-  hub logs only `cred 3316c9a97a9a...` (hash prefix).
-- **I-10 (loopback-only upstream)** — `ANVIL_RING_UPSTREAM=http://example.com:80`
-  → `Error: "upstream must be loopback; the tether only ever proxies locally (I-10)"`
-  at startup *and* re-checked per stream in `StreamCtx::open`.
-- **I-3 (revocation)** — `Registry::authorize` returns `None` the instant `revoke`
-  is called; a live session additionally gets `GOAWAY`.
+7. **No fabricated success (I-11).** With the engine dead the caller now gets
+   `502 Bad Gateway`. See the bug below.
 
-## What is NOT done — the honest gap
+## Bugs found and fixed (each verified, each found by running)
 
-**The hub accepts a tunnel but cannot push a request through it.** `LiveSession.tx`
-exists and the hub's session loop *can* write frames, but nothing constructs the
-`OPEN` frame from an inbound HTTP request. So the data path
-`caller -> hub -> tunnel -> vLLM -> back` does not close yet; the control path
-(auth, lease, teardown) does.
+- **Fabricated 200 for a dead engine (I-11) — the serious one.** The frontend
+  built its response with `.status(head.map(status).unwrap_or(StatusCode::OK))`.
+  Killing the engine produced `200 OK` with a valid chunked terminator and an
+  empty body: indistinguishable from an engine that legitimately streamed
+  nothing. Every caller treats 200 as "the model answered", so there is no retry,
+  no failover, no surfaced error. Fixed by treating an absent head as failure and
+  extracting the decision into `frontend::caller_status_for` so it is testable
+  without a hub/tether/engine (`tests/no_fabricated_success.rs`).
 
-This is why `tx` drew a dead-code warning: it is genuinely not written to yet. I
-kept the field with an explanatory `#[allow(dead_code)]` rather than deleting the
-warning by deleting the plumbing.
+- **`parse_head` stripped `transfer-encoding` from the inbound engine->tether
+  response.** Hop-by-hop filtering is correct for a *forwarded* message and wrong
+  for the message that tells you how to decode a body. A response literally
+  declaring chunked parsed as if it did not.
 
-Also unbuilt: hub-side TLS termination (the test used `ws://` on loopback, which
-`dial()` *permits only for loopback* and refuses otherwise), stream-id allocation
-with reuse control, and the hub's caller-facing HTTP frontend.
+- **`split_head` passed `end + 4`** where `find_header_end` already returns an
+  offset past the CRLFs, starting the body 4 bytes early.
 
-## Bugs found and fixed during this phase
+- **The tether dropped the engine's head when chunked**, forwarding only decoded
+  body, so the hub's `parse_head` returned `None` and every chunk was dropped.
 
-1. **`select!` cannot borrow one struct twice.** `hb.tick()` + `hb.dead()` in one
-   `select!` is two `&mut` method calls on `hb` — opaque to the borrow checker.
-   Fixed by borrowing the two timer *fields* directly, which it can prove disjoint.
-2. **A `tick()` future pins its `Interval`.** `Box::pin(interval.tick())` holds
-   `interval` borrowed, so re-arming is impossible; switched to a re-armed
-   `Pin<Box<Sleep>>`.
-3. **Hand-rolled SHA-256 failed its own known-answer test.** `finish_hex()` called
-   `update()` for padding, which increments the byte counter, so the encoded
-   message length was wrong. Replaced with the `sha2` crate. Recording this
-   because the *reason* I hand-rolled it — "fewer deps for auditability" — is
-   exactly the reasoning that produces vulnerable crypto. `sha2` is the audited
-   choice; I-7 constrains the *artifact*, not the crate count.
-4. **My test asserted a contract the code didn't have** (revoke returning false on
-   a second call). Fixed the test, then fixed the code to the clearer contract:
-   `true` = state changed, `false` = nothing changed.
+- **`transfer-encoding` was stripped from the caller's response** (correct per
+  RFC) while the payload was forwarded in raw chunk framing, so hyper framed an
+  already-chunked body a second time. Root of the "chunk length disagrees with
+  its data" symptom.
 
-## Naming rule (operator directive — do not revisit casually)
+- **My hand-rolled SHA-256 failed its own empty-input KAT.** Written to "reduce
+  dependencies for auditability"; replaced with `sha2`. I-7 constrains the
+  artifact, not the crate count.
 
-Binary and every invocation: **`anvil-ring`**. No bare `ring`, no short alias.
+## The bug that is still open
+
+The tunnel delivers the **first** event and then ends the stream. Reproduced
+against a fresh hub, one tether, one verified engine. The leading theory, from a
+tether-side trace, is in `tunnel.rs`'s first-read branch: it forwards the head as
+frame 1 and one decoded chunk as frame 2, and the `continue` after that skips the
+`saw_end`/terminator handling, so a coalesced read contributes one event.
+The engine's own response is complete (verified directly against it: 131 bytes,
+three events). The standalone proxy delivers all three.
+
+## Do not trust the earlier "live" results in git history
+
+Two measurement errors contaminated most live testing on 2026-08-28 and are worth
+remembering as method, not as this project's state:
+
+- **Stale processes.** `process kill` reported success while the process survived;
+  tethers from 16 minutes earlier kept holding hub registrations while new ones
+  launched. Always `pkill -9 -f anvil-ring` and verify with `ps` before a run.
+- **`| tee` buffers stderr**, so an absence of trace lines meant "buffered", not
+  "not reached".
+
+Also: byte-identical responses appearing across logically different builds was
+the tell that a "live" run was executing in-process test code, not the binaries.
+
+## Test inventory
+
+- lib: 38 tests — frames, proxy, headers, hub registry/leases, chunked decoder.
+- `no_fabricated_success`: 3 (I-11 regression).
+- `chunked_decoder`: 1. `proxy_e2e`: 9.
+- `forward_e2e`: 4 — 2 pass (auth), 2 fail (open data-path bug).
+- clippy: the `is_hop_by_hop` "never used" warning on the bin target is the
+  unused-linter's known false positive.

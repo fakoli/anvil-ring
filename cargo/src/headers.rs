@@ -25,6 +25,20 @@ pub const ALWAYS_STRIP: &[&str] = &[
     "host", // replaced per-hop by the client side
 ];
 
+/// The one definition of the always-hop-by-hop rule for this crate (RFC 9110 §7.6.1).
+///
+/// Note the asymmetry: `strip_hop_by_hop` additionally removes names *named by
+/// this message's* `Connection:` header, per-message state this pure predicate
+/// cannot see. Anything forwarding a message must use `strip_hop_by_hop`; this
+/// exists for the response-head path, which rebuilds a header map and needs only
+/// the always-strip rule applied while parsing.
+pub fn is_hop_by_hop(name: impl AsRef<[u8]>) -> bool {
+    let n = name.as_ref();
+    ALWAYS_STRIP
+        .iter()
+        .any(|h| h.as_bytes().eq_ignore_ascii_case(n))
+}
+
 /// Strip hop-by-hop headers, honouring the tokens named by `Connection:`.
 /// Returns how many headers were removed (for logging/metrics).
 pub fn strip_hop_by_hop(headers: &mut HeaderMap) -> usize {
