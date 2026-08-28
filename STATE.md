@@ -180,6 +180,34 @@ next reader trusts.
 present -- it documents current behaviour, deliberately, and must be inverted
 when the head stops carrying the header.
 
+## THE TERMINATOR IS FABRICATED (I-11 violation) - decisive test
+
+Engine rewritten to NEVER finish (10 events, 3 s apart). Caller still received:
+  B\r\ndata: ev00\n\r\n0\r\n\r\n        <- a COMPLETE terminator at t=0.0s
+Hub received exactly 1 DATA frame (n=11). Tether: 1 read, k=96.
+Tether's own trace: PUMP head_split=Some(16)  (head 80 + one 16-byte chunk
+  "B\r\ndata: ev00\n\r\n").
+
+Nothing in the hub or frontend can emit `0\r\n\r\n`; the de-chunker emits that only
+when it sees the engine's real terminating zero-size chunk. Therefore the tether
+declared the body complete after ONE chunk and sent Frame::End, and the hub/frontend
+honestly relayed an END that was never real. This is exactly the I-11 failure the
+project exists to prevent: a fabricated success.
+
+With a 300 ms engine the same path produced the caller-visible single event;
+with a 5 s engine the terminator still arrived at t=0.0s, i.e. BEFORE the engine
+emitted event two. So the truncation is NOT a race, NOT starvation of the read arm,
+and NOT byte loss in the de-chunker.
+
+NEXT: ChunkedDecoder end-detection on the COALESCED path, where the pump decodes the
+whole remainder in a loop `while !r.done { push(r.consumed) }`. `r.done` after a
+single well-formed chunk must NOT be treated as end-of-body: HTTP/1.1 chunked ends
+only at a zero-size chunk, and here the first read legitimately contains the head
+plus chunk #1 while chunks #2..N are still in flight. The inline drain appears to
+consume the head's trailing bytes as if they were part of the chunk stream, OR
+treats a chunk-aligned read as EOF. Reproduce with a decoder fed
+"B\r\ndata: ev00\n\r\n" and assert done == false.
+
 ## FINDINGS (this turn) - MEASURED, both ends of the tunnel
 
 Tether (verified-live stack, one hub, one tether, one fake engine, lsof-checked):

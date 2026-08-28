@@ -403,6 +403,7 @@ async fn run_session(
                                                 }
                                                 Ok(k) => {
                                                     eprintln!("PUMP read k={k}");
+                                                    eprintln!("PUMP head_split={:?}", split_head(&buf[..k]).map(|(_h, b2)| b2.len()));
                                                     // Decide on the FIRST read, from the head
                                                     // we already have: only a chunked body gets
                                                     // decoded. A plain content-length body must
