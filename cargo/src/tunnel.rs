@@ -248,6 +248,24 @@ async fn run_session(
             }
             _ = hb.ping_tick.as_mut() => {
                 let _ = tx.send(msg(Frame::Ping));
+                // RE-ARM. Without this the interval fires exactly once and the
+                // tunnel goes silent for the rest of its life, because the ONLY
+                // other place that rearms these timers is `hb.reset()` in the
+                // inbound arm -- which requires an INBOUND frame, and an idle
+                // tunnel receives none.
+                //
+                // Measured, before this line existed: the hub tore the session
+                // down on a timer three times running --
+                //     Up(6.226s)  Up(6.213s)  Up(6.203s)
+                // consistent to 20ms, which is a watchdog, not data loss -- and
+                // the tether reconnected each time. Every frame still reached
+                // `sink.send` with Ok, because writes to a socket whose peer just
+                // stopped READING still buffer normally; the reset only surfaces
+                // once the buffers fill. A streaming response longer than the
+                // silence window therefore loses everything after its first event.
+                hb.ping_tick
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + PING_INTERVAL);
             }
             _ = hb.dead.as_mut() => {
                 return Err("heartbeat timeout: peer declared dead (I-6)".into());
@@ -536,6 +554,14 @@ async fn run_session(
                         return Err("unexpected HELLO/WELCOME mid-session".into());
                     }
                 }
+                // Also re-arm on ANY inbound frame, not just PONG: traffic is
+                // proof of life, and insisting on a pong during a busy stream
+                // would tear down a healthy tunnel.
+                //
+                // NOTE the `continue` above (control frames decode to None) skips
+                // this line, so a tunnel whose peer answers only with WS-level
+                // pings would still be rearmed by ping_tick's own arm -- but not
+                // the reverse. Kept here so real traffic always counts.
                 hb.reset();
             }
         }

@@ -59,58 +59,51 @@ through the tunnel.** Not production-ready.
   dependencies for auditability"; replaced with `sha2`. I-7 constrains the
   artifact, not the crate count.
 
-## The bug that is still open — narrowed to an exact mechanism
+## The bug that is still open — ROOT CAUSE FOUND for the tunnel half
 
-The tunnel delivers the first event, then the stream stops. **Two real bugs were
-found and fixed on the way here:**
+### Fixed: the tether's ping interval fired once and never re-armed
 
-1. **`None => break` in the per-stream `select!`.** The request-side receiver
-   yields `None` whenever no sender exists right now — the NORMAL state, since the
-   only holder of the sender is the session loop on another task and a GET with no
-   body sends nothing. Treating that as end-of-stream, in an arm biased by a 1 ms
-   sleep against an engine answering ~300 ms away, cancelled the in-flight engine
-   read. Fixed with a `request_side_idle` latch that DISABLES the arm instead of
-   aborting, preserving both the read and the idle timeout.
-2. **The framing decision was not sticky.** Head and first body bytes usually
-   arrive in separate reads (time-to-first-token), so the old
-   `dechunk.is_none() && !head_seen` guard left `dechunk` unset on body reads,
-   which then forwarded RAW chunk framing. Replaced with a real tri-state
-   `HeadState { Unknown, Chunked, Plain }`.
+`hb.ping_tick` sent one `Frame::Ping` and was never reset. The only other re-arm
+is `hb.reset()` in the inbound-frame arm, which requires an INBOUND frame — and an
+idle tunnel receives none. So after ~6s the tunnel went permanently silent, the
+hub's `TETHER_SILENCE` watchdog tore the session down, and the tether reconnected.
 
-Verified fixed by trace — the tether now reads the engine continuously:
-`TT2 k=80 state=Unknown`, then `k=15 / k=15 / k=16 / k=5` all `state=Chunked`,
-producing 10/10/11/0 bytes, i.e. all three events de-chunked correctly.
+The signature was unmistakable once the hub's own log was read:
 
-**What is still broken, stated precisely:** those forwarded frames enter the
-tunnel's send channel and NEVER reach the socket. Measured on one run:
+    Up(6.226s)  Up(6.213s)  Up(6.203s)  Up(6.197s)
 
-- per-stream task: produced 10 + 10 + 11 bytes (all events); `reply.is_closed()`
-  false, `send()` returned Ok — no error surfaced
-- writer task: alive, `rx.recv()` loop intact, `run_session` never returned
-- hub: received exactly ONE 80-byte frame (the head), then nothing for 20 s
-- caller holding the connection open 20 s: 137 bytes total, then nothing
+Consistent to 20 ms across reconnections. A watchdog, not data loss. Why the loss
+was silent: `sink.send` keeps returning `Ok` after the peer stops READING — writes
+to a socket buffer fine until the buffer fills, so every frame the tether "sent"
+was accepted and never arrived.
 
-So the loss sits between an accepted `tx.send()` and `sink.send()`. Prime suspect:
-the `reply` sender cloned into the stream task is not bound to the channel the
-writer drains (e.g. cloned before the per-connection `tx` was replaced, or the
-writer draining a different `rx` after a reconnect), so accepted sends land in a
-channel nobody reads — which fits "accepted but never emitted, no error".
+Proof the fix works, instrumented hub, one run:
 
-NOT YET CONFIRMED. `TT2 SEND FAILED` never fired, so nothing surfaced an error,
-and I did not instrument `tx`/`rx` identity across the clone. Next step is
-exactly that: print the channel/sender identity at clone time and at send time.
+    H RECV DATA 80 bytes   (head)
+    H RECV DATA 10 bytes   (data: one)
+    H RECV DATA 10 bytes   (data: two)
+    H RECV DATA 11 bytes   (data: done)
 
-## Diagnostic traces ARE IN THE WORKING TREE (remove before shipping)
+Previously: only the 80-byte frame, ever.
 
-Uncommitted `eprintln!` traces: `TT2` and `TT3` in tunnel.rs, `HU ` in hub.rs.
-They are the fastest way to re-orient on this bug:
+### Still failing: the hub receives all four frames; the caller gets 137 bytes
 
-    grep -n 'TT2\|TT3\|HU ' cargo/src/*.rs
+137 = head + `data: one`, in a single read. So the remaining fault is inside the
+hub's own DATA -> `ChunkOrEnd` -> `TunnelBody` routing, and it is now a small,
+well-bounded surface rather than a mystery. Candidates, in order:
 
-Traces write to stderr. NOTE: piping through `tee` BUFFERS stderr, which earlier
-made a live path look dead — read tracked process output directly instead.
+1. The hub treats the FIRST DATA frame as the head and only THEN starts
+   forwarding; if the first frame is consumed for head parsing and its `rest`
+   mishandled, early body bytes are lost while later ones should survive — but
+   the caller sees exactly ONE event, so look at what the frontend's `TunnelBody`
+   does after yielding the first chunk (the `ChunkOrEnd::Chunk` receiver may be
+   dropped or the stream ended after one item).
+2. `head()` polls `st.head()` with a bounded ~1s wait; confirm it is not also
+   cancelling/ending the body subscription.
 
-## Measurement discipline (earned the hard way, twice)
+**The earlier hypothesis below is REFUTED — keep for history only.** It said the
+hub session loop died mid-stream. The session lifetime was a watchdog artifact of
+the ping bug, not a cause of the truncation.
 
 - `process kill` can report success while the process survives; tethers from
   16 minutes earlier kept holding hub registrations. Always
