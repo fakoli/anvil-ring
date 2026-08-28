@@ -54,8 +54,21 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends musl-tools
-          sudo ln -sf "$(command -v musl-gcc)" "/usr/local/bin/${{ matrix.arch }}-linux-musl-gcc"
+          # NOT musl-tools: musl-gcc is the NATIVE musl compiler, so symlinking it to
+          # the arch-prefixed name cc-rs asks for yields a compiler whose collect2
+          # falls back to the HOST /usr/bin/ld. That then chokes on the target's
+          # self-contained crt1.o -- "Relocations in generic ELF (EM: 183)" is the aarch64
+          # ELF machine id meeting an x86-64 linker. Compile succeeded; only the link
+          # failed, which is what pinpoints the linker rather than the toolchain as a
+          # whole. Need a real cross-gcc, which Ubuntu ships for the foreign arch.
+          sudo apt-get install -y --no-install-recommends \
+            "gcc-${{ matrix.arch }}-linux-musl"
+          "${{ matrix.arch }}-linux-musl-gcc" -dumpmachine | grep -q "^${{ matrix.arch }}" \
+            || { echo "::error::cross gcc not actually targeting ${{ matrix.arch }}"; exit 1; }
+          # Prove the linker is the cross one, not /usr/bin/ld, before a 100s build.
+          "${{ matrix.arch }}-linux-musl-gcc" -print-prog-name=ld | tee /tmp/ldused
+          grep -v "^/usr/bin/ld$" /tmp/ldused >/dev/null \
+            || { echo "::error::cross gcc is still resolving the host ld"; exit 1; }
           "${{ matrix.arch }}-linux-musl-gcc" --version | head -1
 
       - name: Build (release, locked)
