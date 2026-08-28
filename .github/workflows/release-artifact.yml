@@ -61,8 +61,18 @@ jobs:
           # ELF machine id meeting an x86-64 linker. Compile succeeded; only the link
           # failed, which is what pinpoints the linker rather than the toolchain as a
           # whole. Need a real cross-gcc, which Ubuntu ships for the foreign arch.
+          # Ubuntu ships musl cross compilers as multiarch gcc-* packages: a single
+          # `gcc-musl-<arch>` whose -b flag selects the target. The host-arch variant
+          # (gcc-<arch>-linux-musl) only exists for arches Ubuntu multiarch-es, which
+          # is why x86_64 appeared to work and aarch64 did not.
           sudo apt-get install -y --no-install-recommends \
-            "gcc-${{ matrix.arch }}-linux-musl"
+            "gcc-musl-${{ matrix.arch }}" "gcc-${{ matrix.arch }}-linux-gnu"
+          # Provide the arch-prefixed name cc-rs asks for. gcc-musl-* installs as
+          # <trip>-musl-gcc / musl-gcc-<arch> depending on release, so resolve it
+          # rather than assuming a path.
+          src="$(ls /usr/bin/*musl*gcc 2>/dev/null | grep -F "${{ matrix.arch }}" | head -1)"
+          test -n "$src" || { echo '::error::no musl gcc found for ${{ matrix.arch }}'; ls /usr/bin/*musl* 2>/dev/null; exit 1; }
+          sudo ln -sf "$src" "/usr/local/bin/${{ matrix.arch }}-linux-musl-gcc"
           "${{ matrix.arch }}-linux-musl-gcc" -dumpmachine | grep -q "^${{ matrix.arch }}" \
             || { echo "::error::cross gcc not actually targeting ${{ matrix.arch }}"; exit 1; }
           # Prove the linker is the cross one, not /usr/bin/ld, before a 100s build.
