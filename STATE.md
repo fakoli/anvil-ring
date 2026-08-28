@@ -260,8 +260,15 @@ Two consequences the I-6 fix must respect:
    a RECONNECT (not just a teardown) leaving the tunnel routable.
 
 Still worth a live check when convenient: how often the fleet's tethers actually
-redial, so the reconnect path gets proportional test coverage. The soak script
-(/tmp/soak_tunnel.py) is the tool; it asserted steady state on an idle tunnel.
+redial, so the reconnect path gets proportional test coverage. The soak script is now IN-REPO and
+reboot-safe: `python3 cargo/scripts/soak_tunnel.py <secs> "$PWD/target/debug/anvil-ring"`
+(pass the binary explicitly -- it refuses to guess, because a stale binary from PATH
+cost hours during this investigation). It asserted steady state on an idle tunnel:
+1 authorization, 0 resets, 0 refusals, 0 dial failures, tunnel Up, all procs alive.
+NOTE: it measures an IDLE tunnel. It cannot measure reconnect frequency, because an
+idle tunnel has no reason to reconnect -- so do not read its verdict as "reconnects are
+rare in production". That misread is what made me downgrade the detach clobber to
+"latent" (corrected in the section above).
 
 ## OPERATOR RULE (absolute): never touch ai-mbp25
 
