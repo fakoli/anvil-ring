@@ -252,3 +252,36 @@ Two consequences the I-6 fix must respect:
 Still worth a live check when convenient: how often the fleet's tethers actually
 redial, so the reconnect path gets proportional test coverage. The soak script
 (/tmp/soak_tunnel.py) is the tool; it asserted steady state on an idle tunnel.
+
+## OPERATOR RULE (absolute): never touch ai-mbp25
+
+Restated by the operator twice, so it is recorded here as well as in agent memory:
+**ai-mbp25 is OFF LIMITS to me entirely.** No SSH to it, nothing read from it, nothing
+run on it — no builds, containers, processes, config changes, probing, or read-only
+"quick tests". It is the operator's active Mac and it HOSTS FLEET SERVICES (Docker
+Desktop: serving containers, the Hermes gateway/dashboard, n8n app + postgres, webui),
+so any action there risks interrupting his co-work or taking services down.
+
+Consequences for this project:
+- Do NOT propose mbp25 as a linux/amd64 / musl / `docker buildx` release-build host.
+  That idea is explicitly rejected, not merely deferred.
+- Do NOT install colima on Mini either (it cannot emulate x86_64).
+- All anvil-ring build/test work stays on fakoli-mini (arm64) under ~/workspace-work.
+  That means debug/CLI/test work only. A real linux/amd64 release artifact has NO
+  authorized build host right now: if one is ever needed, STOP and ask the operator
+  where it happens rather than picking a machine.
+- This project is local-git only, no remote, and `anvil-ring` is the only binary name
+  (no alias).
+
+## MEMORY-HYGIENE LESSON (from tonight)
+
+Durable memory has a hard char budget (~4k) and `replace` swaps the ENTIRE entry that
+matches `old_text`. Consolidating the mbp25 rule into the anvil-ring entry therefore
+DELETED the project facts (local-git-only, binary-name directive, "progress lives in
+STATE.md") while looking like a clean success — the tool reported "Write saved" and the
+usage went down, which reads as a good outcome.
+
+So: never store a new rule by replacing an informative entry. Add a short standalone
+entry, and only replace an entry with text that contains everything that entry already
+said. Anything an entry merely *summarizes* should live in the repo (STATE.md), which is
+versioned, auditable, and cannot be evicted by memory churn.
