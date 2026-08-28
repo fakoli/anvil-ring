@@ -18,9 +18,15 @@ async fn live_body_forwards_every_chunk_before_end() {
 
     // Mirror what the hub does on receipt of each DATA frame, then END.
     tokio::spawn(async move {
-        tx.send(ChunkOrEnd::Chunk("data: one\n".into())).await.unwrap();
-        tx.send(ChunkOrEnd::Chunk("data: two\n".into())).await.unwrap();
-        tx.send(ChunkOrEnd::Chunk("data: three\n".into())).await.unwrap();
+        tx.send(ChunkOrEnd::Chunk("data: one\n".into()))
+            .await
+            .unwrap();
+        tx.send(ChunkOrEnd::Chunk("data: two\n".into()))
+            .await
+            .unwrap();
+        tx.send(ChunkOrEnd::Chunk("data: three\n".into()))
+            .await
+            .unwrap();
         tx.send(ChunkOrEnd::End).await.unwrap();
     });
 

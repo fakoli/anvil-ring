@@ -21,14 +21,15 @@ async fn hyper_relay_of_a_finite_stream_reaches_the_client() {
 
     tokio::spawn(async move {
         loop {
-            let Ok((io, _)) = listener.accept().await else { break };
+            let Ok((io, _)) = listener.accept().await else {
+                break;
+            };
             tokio::spawn(async move {
                 let io = hyper_util::rt::TokioIo::new(io);
                 let svc = service_fn(|_req: Request<hyper::body::Incoming>| async move {
                     // Exactly what our TunnelBody produces: one chunk, then end.
-                    let chunks: Vec<Result<Frame<Bytes>, Infallible>> = vec![
-                        Ok(Frame::data(Bytes::from_static(b"data: one\n"))),
-                    ];
+                    let chunks: Vec<Result<Frame<Bytes>, Infallible>> =
+                        vec![Ok(Frame::data(Bytes::from_static(b"data: one\n")))];
                     let body = StreamBody::new(stream::iter(chunks)).boxed_unsync();
                     Ok::<_, Infallible>(
                         Response::builder()
@@ -46,9 +47,7 @@ async fn hyper_relay_of_a_finite_stream_reaches_the_client() {
     });
 
     // Read with a REAL client so framing is interpreted, not guessed.
-    let io = hyper_util::rt::TokioIo::new(
-        tokio::net::TcpStream::connect(addr).await.unwrap(),
-    );
+    let io = hyper_util::rt::TokioIo::new(tokio::net::TcpStream::connect(addr).await.unwrap());
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
     tokio::spawn(async move {
         let _ = conn.await;
@@ -58,7 +57,9 @@ async fn hyper_relay_of_a_finite_stream_reaches_the_client() {
         .method("POST")
         .uri("/v1/chat/completions")
         .header(hyper::header::HOST, addr.to_string())
-        .body(StreamBody::new(stream::empty::<Result<Frame<Bytes>, Infallible>>()))
+        .body(StreamBody::new(stream::empty::<
+            Result<Frame<Bytes>, Infallible>,
+        >()))
         .unwrap();
 
     let resp = sender.send_request(req).await.unwrap();
@@ -66,7 +67,11 @@ async fn hyper_relay_of_a_finite_stream_reaches_the_client() {
     let mut body = BodyExt::boxed(resp.into_body());
     while let Some(frame) = BodyExt::frame(&mut body).await {
         let f = frame.expect("frame").into_data().expect("data frame");
-        eprintln!("CLIENT got {} bytes: {:?}", f.len(), String::from_utf8_lossy(&f));
+        eprintln!(
+            "CLIENT got {} bytes: {:?}",
+            f.len(),
+            String::from_utf8_lossy(&f)
+        );
         got.extend_from_slice(&f);
     }
 
