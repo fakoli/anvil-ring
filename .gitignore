@@ -1,13 +1,10 @@
 __pycache__/
 *.pyc
 .venv/
-.pytest_cache/
+.ccp_cproxy/venv/
 .ruff_cache/
+.pytest_cache/
+target/
+*egg-info/
 build/
 dist/
-*.egg-info/
-graphify-out/
-# Never commit tether state or tokens
-*.state
-*.token
-.env

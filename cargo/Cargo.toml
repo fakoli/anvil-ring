@@ -1,0 +1,44 @@
+[package]
+name = "anvil-ring"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Outbound-initiated proxy in front of vLLM/SGLang for the Anvil family"
+license = "MIT"
+# Binary name is `anvil-ring` -- always anvil-prefixed, no bare `ring` alias.
+# Operator directive, not style: the prefix is the namespace and the collision
+# avoidance. See docs/origin-story.md.
+default-run = "anvil-ring"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "signal", "sync"] }
+hyper = { version = "1", features = ["http1", "server", "client"] }
+# NOTE: hyper-util's "full" feature pulls client-proxy-system -> system-configuration
+# (macOS-only) and would break the Linux musl static build required by I-7. Use the
+# exact minimal feature set instead.
+hyper-util = { version = "0.1", features = ["tokio", "http1", "server", "server-auto"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+futures-util = "0.3"
+
+# I-7: one static, self-contained artifact. Build for
+# aarch64-unknown-linux-musl / x86_64-unknown-linux-musl so the binary has no
+# dynamic dependencies and nothing must be installed on the rental host.
+[profile.release]
+opt-level = 2
+strip = true
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[[bin]]
+# NEGATIVE CONTROL for the I-9 streaming test. This target deliberately buffers
+# the whole upstream response before replying. `tests/negative_control.rs` runs
+# the same streaming assertion against it and requires it to FAIL -- a guard that
+# cannot fail has no teeth. Always built, so CI cannot silently skip the check.
+name = "anvil-ring-buffering-canary"
+path = "src/bin/buffering_canary.rs"
+
+[features]
+default = []
