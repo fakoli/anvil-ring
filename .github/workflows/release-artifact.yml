@@ -43,47 +43,29 @@ jobs:
         with:
           workspaces: cargo
 
-      # A build script in the dependency tree compiles C via cc-rs, which looks for
-      # <arch>-linux-musl-gcc -- not the host cc. Ubuntu runners ship neither the
-      # cross gcc nor a musl libc for it, so musl builds fail with
-      #   cc-rs: failed to find tool "aarch64-linux-musl-gcc"
-      # musl-tools provides musl-gcc plus the libc; the symlink gives cc-rs the
-      # arch-prefixed name it actually asks for. (Caught by the first real CI run:
-      # both matrix legs failed here identically, so it was toolchain, not config.)
-      - name: Install musl cross toolchain
+      # Build inside rust:1.85-alpine via Docker, mirroring docs/cross-build.md
+      # Option A -- the project's own documented, intended path -- rather than
+      # assembling a cross toolchain from apt packages on the runner.
+      #
+      # Why this replaced the apt approach: three attempts (musl-tools symlink ->
+      # host /usr/bin/ld rejecting aarch64 crt1.o; gcc-<arch>-linux-musl existing only
+      # for multiarch'd arches; gcc-musl-<arch> not existing at all, 'Unable to locate
+      # package') were all guessing package names, each costing ~2 min. The alpine
+      # image has musl as its NATIVE libc, so there is no cross linker to get wrong:
+      # cc, as, and ld all already target musl for that arch. --platform makes Docker
+      # emulate the target arch, which is exactly what aarch64-musl needs.
+      - name: Build in rust:alpine (Docker, per docs/cross-build.md Option A)
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          # NOT musl-tools: musl-gcc is the NATIVE musl compiler, so symlinking it to
-          # the arch-prefixed name cc-rs asks for yields a compiler whose collect2
-          # falls back to the HOST /usr/bin/ld. That then chokes on the target's
-          # self-contained crt1.o -- "Relocations in generic ELF (EM: 183)" is the aarch64
-          # ELF machine id meeting an x86-64 linker. Compile succeeded; only the link
-          # failed, which is what pinpoints the linker rather than the toolchain as a
-          # whole. Need a real cross-gcc, which Ubuntu ships for the foreign arch.
-          # Ubuntu ships musl cross compilers as multiarch gcc-* packages: a single
-          # `gcc-musl-<arch>` whose -b flag selects the target. The host-arch variant
-          # (gcc-<arch>-linux-musl) only exists for arches Ubuntu multiarch-es, which
-          # is why x86_64 appeared to work and aarch64 did not.
-          sudo apt-get install -y --no-install-recommends \
-            "gcc-musl-${{ matrix.arch }}" "gcc-${{ matrix.arch }}-linux-gnu"
-          # Provide the arch-prefixed name cc-rs asks for. gcc-musl-* installs as
-          # <trip>-musl-gcc / musl-gcc-<arch> depending on release, so resolve it
-          # rather than assuming a path.
-          src="$(ls /usr/bin/*musl*gcc 2>/dev/null | grep -F "${{ matrix.arch }}" | head -1)"
-          test -n "$src" || { echo '::error::no musl gcc found for ${{ matrix.arch }}'; ls /usr/bin/*musl* 2>/dev/null; exit 1; }
-          sudo ln -sf "$src" "/usr/local/bin/${{ matrix.arch }}-linux-musl-gcc"
-          "${{ matrix.arch }}-linux-musl-gcc" -dumpmachine | grep -q "^${{ matrix.arch }}" \
-            || { echo "::error::cross gcc not actually targeting ${{ matrix.arch }}"; exit 1; }
-          # Prove the linker is the cross one, not /usr/bin/ld, before a 100s build.
-          "${{ matrix.arch }}-linux-musl-gcc" -print-prog-name=ld | tee /tmp/ldused
-          grep -v "^/usr/bin/ld$" /tmp/ldused >/dev/null \
-            || { echo "::error::cross gcc is still resolving the host ld"; exit 1; }
-          "${{ matrix.arch }}-linux-musl-gcc" --version | head -1
-
-      - name: Build (release, locked)
-        working-directory: cargo
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin anvil-ring
+          docker run --rm --platform "linux/${{ matrix.arch }}" \
+            -v "$PWD/cargo":/src -w /src \
+            -v anvil-ring-registry-${{ matrix.arch }}:/usr/local/cargo/registry \
+            rust:1.85-alpine sh -c '
+              set -eu
+              apk add --no-cache musl-dev >/dev/null
+              rustup target add ${{ matrix.target }} >/dev/null
+              cargo build --release --locked --target ${{ matrix.target }} --bin anvil-ring
+            '
 
       - name: Gate -- binary must be statically linked (I-7)
         run: |
