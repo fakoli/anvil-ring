@@ -96,6 +96,12 @@ green only at step 4.
    it, then drop the sink, so session end actually closes TCP.
    PROOF: a probe that aborts the tether's task and asserts the HUB observes death
    within ~2s (currently it observes none -- measured 74x `stream.next -> Some(Ok)`).
+   EVIDENCE (observed, not theorized): a tether with no request in flight emitted
+   ~700 WS frames (heartbeats/pings) before it was killed. Liveness measured as
+   'any inbound traffic' therefore reports a stuck tether as alive forever, and the
+   45s watchdog can never fire -- which is exactly the measured 65s-of-streaming
+   failure. The keepalive must be answered by the CODE THAT PROCESSES STREAMS, not
+   by the socket layer.
 2. **Reachability is not liveness.** Stop letting any inbound byte refresh
    `last_seen`: keepalive must be a bidirectional proof (hub Ping -> tether Pong
    within one interval), because a tether stuck mid-loop still answers Pings.
