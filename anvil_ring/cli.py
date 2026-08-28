@@ -48,6 +48,18 @@ def cmd_revoke(args: argparse.Namespace) -> int:
     return _not_implemented(f"revoke {args.tether}")
 
 
+def cmd_probe(args: argparse.Namespace) -> int:
+    """Egress probe: records which outbound ports this host permits (ADR-0002)."""
+    from anvil_ring import probe_egress
+
+    argv: list[str] = []
+    if args.out:
+        argv += ["--out", args.out]
+    for t in args.target or []:
+        argv += ["--target", t]
+    return probe_egress.main(argv)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=PROG,
@@ -74,6 +86,19 @@ def build_parser() -> argparse.ArgumentParser:
     rv = sub.add_parser("revoke", help="on the hub: revoke a tether credential")
     rv.add_argument("tether")
     rv.set_defaults(func=cmd_revoke)
+
+    pb = sub.add_parser(
+        "probe-egress",
+        help="record which outbound ports this host permits (ADR-0002 evidence)",
+    )
+    pb.add_argument("--out", default="egress-probe.json")
+    pb.add_argument(
+        "--target",
+        action="append",
+        metavar="HOST:PORT[:MODE]",
+        help="extra probe target (repeatable); MODE in tls|tcp|ssh-banner",
+    )
+    pb.set_defaults(func=cmd_probe)
 
     return p
 

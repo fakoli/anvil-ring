@@ -47,8 +47,9 @@ Read [docs/origin-story.md](docs/origin-story.md) for the reasoning, and
 | Piece | State |
 |---|---|
 | Design contract, invariants, ADR-0001 | ✅ written |
+| Egress probe tool (`anvil-ring probe-egress`) | ✅ built, run, evidence recorded (ADR-0003) |
 | Registration + token lifecycle | ⬜ not started |
-| Transport (chisel vs. `ssh -R`) | ⚠️ **undecided** — ADR-0002 |
+| Transport (chisel vs. `ssh -R`) | ⚠️ **undecided** — ADR-0002, needs one probe *from a rental* |
 | Hub (macOS/launchd + container) | ⬜ not started |
 | Working end-to-end test | ⬜ not started |
 
