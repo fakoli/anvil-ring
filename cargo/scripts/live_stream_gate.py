@@ -31,9 +31,13 @@ import time
 from urllib.request import Request, urlopen
 # Local test-only values. Real deployments use wss:// and real secrets; these are
 # deliberately inert so this file can be committed and shared (I-7 de-identification).
-HUB_PORT = 19920
-FRONT_PORT = 19922
-ENGINE_PORT = 19905
+# Bind deliberately omits SO_REUSEADDR: a successful bind proves the port was ours, so
+# results cannot come from a different process still holding the port. That corruption
+# cost hours during the I-6 investigation -- never "fix" a conflict by loosening the
+# bind; move to another port pair (below) and re-run.
+HUB_PORT = 19930
+FRONT_PORT = 19932
+ENGINE_PORT = 19915
 CRED = "tun"
 CALLER_TOKEN = "cal"
 HOST = "127.0.0.1"
