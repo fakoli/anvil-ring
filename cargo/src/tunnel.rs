@@ -242,7 +242,7 @@ async fn run_session(
     loop {
         tokio::select! {
                     _ = lease_tick.as_mut() => {
-                        log("lease window elapsed; reconnecting to re-authorize");
+                                                log("lease window elapsed; reconnecting to re-authorize");
                         let _ = tx.send(msg(Frame::GoAway { reason: b"lease refresh".to_vec() }));
                         return Ok(());
                     }
@@ -268,7 +268,7 @@ async fn run_session(
                             .reset(tokio::time::Instant::now() + PING_INTERVAL);
                     }
                     _ = hb.dead.as_mut() => {
-                        return Err("heartbeat timeout: peer declared dead (I-6)".into());
+                                                return Err("heartbeat timeout: peer declared dead (I-6)".into());
                     }
                     m = stream.next() => {
                         let m = match m {
