@@ -30,8 +30,12 @@ jobs:
         include:
           - arch: aarch64
             target: aarch64-unknown-linux-musl
+            platform: arm64
+            file_arch: ARM aarch64
           - arch: x86_64
             target: x86_64-unknown-linux-musl
+            platform: amd64
+            file_arch: x86-64
     steps:
       - uses: actions/checkout@v4
 
@@ -42,6 +46,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: cargo
+
+      # GitHub's hosted runner is x86_64. Without binfmt, Docker can pull the arm64
+      # image but cannot exec /bin/sh in it (`exec format error`) -- exactly what the
+      # first Docker run proved. This is Docker's canonical hosted-runner path;
+      # x86_64 stays native and pays no emulation cost.
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.platform == 'arm64'
+        with:
+          platforms: arm64
 
       # Build inside rust:1.85-alpine via Docker, mirroring docs/cross-build.md
       # Option A -- the project's own documented, intended path -- rather than
@@ -57,7 +70,7 @@ jobs:
       - name: Build in rust:alpine (Docker, per docs/cross-build.md Option A)
         run: |
           set -euo pipefail
-          docker run --rm --platform "linux/${{ matrix.arch }}" \
+          docker run --rm --platform "linux/${{ matrix.platform }}" \
             -v "$PWD/cargo":/src -w /src \
             -v anvil-ring-registry-${{ matrix.arch }}:/usr/local/cargo/registry \
             rust:1.85-alpine sh -c '
@@ -74,14 +87,25 @@ jobs:
           test -x "$BIN"
           info="$(file "$BIN")"
           echo "$info"
-          # 'statically linked' is the pass condition. Anything else fails, so a
-          # regression cannot sneak past by reporting something we did not spell
-          # out. ldd is checked second: some toolchains print 'statically linked'
-          # while still recording an interpreter.
+          # GNU `file` reports PIE static binaries as `static-pie linked`, not
+          # `statically linked` -- the first x86_64 artifact proved that exact output.
+          # Both are valid I-7 artifacts. Architecture is checked too so a mislabeled
+          # matrix artifact cannot pass the static check.
           case "$info" in
-            *"statically linked"*) ;;
+            *"${{ matrix.file_arch }}"*) ;;
+            *) echo "::error::wrong architecture, expected ${{ matrix.file_arch }}: $info"; exit 1 ;;
+          esac
+          case "$info" in
+            *"statically linked"*|*"static-pie linked"*) ;;
             *) echo "::error::expected a static binary, got: $info"; exit 1 ;;
           esac
+          # Stronger than wording: a dynamic ELF has a PT_INTERP segment naming its
+          # loader. A truly static / static-PIE executable has none.
+          if readelf -l "$BIN" | grep -q 'INTERP'; then
+            echo "::error::binary has a PT_INTERP loader segment -- it is dynamic"
+            readelf -l "$BIN" | grep -A1 INTERP
+            exit 1
+          fi
           if command -v ldd >/dev/null 2>&1; then
             out="$(ldd "$BIN" 2>&1 || true)"
             echo "$out"
