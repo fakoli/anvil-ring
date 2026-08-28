@@ -83,17 +83,39 @@ liveness proof is satisfied by traffic it is not processing.** In the fleet that
 is a GPU rental whose tunnel is alive-but-stuck while the engine behind it is
 gone -- the caller should be cut off, not fed.
 
-Design fix, NOT yet implemented (do not rush it):
-1. Keepalive must prove the peer is PROCESSING, not merely reachable. Ignore Pong
-   for liveness, or require a bidirectional proof (hub Ping -> tether Pong within
-   one interval) rather than counting any inbound byte.
-2. Close the socket deterministically when the tether's session is ending: join or
-   abort the writer task and drop the sink, so a leaked half cannot keep the
-   connection alive.
-3. Then end every stream that tether was serving (the drain already written at the
-   loop exit handles that once the exit is reachable).
-4. Add an explicit `tether_gone` signal so the frontend can end callers without
-   waiting on the watchdog at all.
+### I-6 fix plan -- staged, each step independently verifiable
+
+Ordered so the riskiest reasoning is tested before it is relied on. Each step names
+its own proof, and the suite must stay at 54 lib + forward_e2e 3/4 (plus the new
+assertions) after every step, with `tether_death_midstream_ends_the_caller` turning
+green only at step 4.
+
+1. **Deterministic sink teardown.** The session currently ends with the reader half
+   only; `ws.split()` means the writer task keeps the socket open, so the peer sees
+   a live connection forever. Take explicit ownership: signal the writer task, await
+   it, then drop the sink, so session end actually closes TCP.
+   PROOF: a probe that aborts the tether's task and asserts the HUB observes death
+   within ~2s (currently it observes none -- measured 74x `stream.next -> Some(Ok)`).
+2. **Reachability is not liveness.** Stop letting any inbound byte refresh
+   `last_seen`: keepalive must be a bidirectional proof (hub Ping -> tether Pong
+   within one interval), because a tether stuck mid-loop still answers Pings.
+   PROOF: a fixture tether that answers Pong but never processes OPEN, asserted to be
+   declared dead within the window -- and NOT declared dead while genuinely working.
+3. **Bounded command channel.** `LiveSession.tx` is an `UnboundedSender<Frame>`, so a
+   wedged tether accumulates hub memory without limit (fleet-wide blast radius, see
+   below). Bound it; refuse new streams when full and fail that caller fast rather
+   than queueing toward an engine that cannot answer.
+   PROOF: a probe that fills the bound and shows the caller gets a fast 503 while
+   existing streams finish, instead of unbounded queueing.
+4. **End the callers.** Only once 1-3 hold: on session exit, end every stream that
+   tether was serving (the drain written at the loop exit works once the exit is
+   reachable), and surface an explicit `tether_gone` so the frontend can cut callers
+   off without waiting on the watchdog.
+   PROOF: `tether_death_midstream_ends_the_caller` passes; caller sees the stream END
+   rather than a fabricated terminator (I-11) or a hang.
+
+Do NOT start at step 4: cutting callers off is only correct once the hub can actually
+tell a dead tether from a busy one, which is exactly what steps 1-2 establish.
 
 Also fixed while investigating, and it stays fixed: `decode` used to return
 `Ok(None)` for `Message::Text`/`Message::Frame`, which would have made a real RST
