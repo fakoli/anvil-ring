@@ -27,14 +27,34 @@ use tokio::sync::mpsc;
 
 /// Either a live tunnel stream, or a fixed body for an error or health answer.
 pub enum TunnelBody {
-    Live(Arc<Mutex<Option<mpsc::Receiver<ChunkOrEnd>>>>),
+    /// `Arc<Forwarded>` keeps the stream registered, and the stream's channel
+    /// sender alive, for as long as this body exists. Without it the frontend's
+    /// `Forwarded` dies at the end of the request handler, `StreamGuard::drop`
+    /// unregisters the stream and releases the last sender mid-response, and the
+    /// body ends early while looking complete. See `Forwarded::into_body`.
+    Live(
+        Arc<Mutex<Option<mpsc::Receiver<ChunkOrEnd>>>>,
+        Arc<crate::hub::Forwarded>,
+    ),
     Fixed(Bytes),
 }
 
 impl TunnelBody {
     /// A body that streams the engine's answer through `rx`.
-    pub fn live(rx: mpsc::Receiver<ChunkOrEnd>) -> Self {
-        TunnelBody::Live(Arc::new(Mutex::new(Some(rx))))
+    ///
+    /// The `Forwarded` is required, not incidental: it is what keeps the hub's
+    /// stream registration and channel sender alive until the body is drained.
+    pub fn live(rx: mpsc::Receiver<ChunkOrEnd>, stream: Arc<crate::hub::Forwarded>) -> Self {
+        TunnelBody::Live(Arc::new(Mutex::new(Some(rx))), stream)
+    }
+
+    /// Convenience: consume the forwarded stream into its own body, so the
+    /// stream's lifetime is exactly the response's lifetime.
+    pub fn from_forwarded(fwd: crate::hub::Forwarded) -> Self {
+        let rx = fwd
+            .take_rx()
+            .expect("stream already handed over its receiver");
+        TunnelBody::live(rx, Arc::new(fwd))
     }
 
     /// A body with all its bytes known up front (health, errors). Sets
@@ -61,7 +81,7 @@ impl Stream for TunnelBody {
                     Poll::Ready(Some(Ok(std::mem::take(buf))))
                 }
             }
-            TunnelBody::Live(slot) => {
+            TunnelBody::Live(slot, _stream) => {
                 // Take the receiver out for this poll. The mutex is held only for
                 // this statement -- never across the `poll_next` below -- so a
                 // competing poll waits on the lock rather than on our work.
@@ -83,6 +103,7 @@ impl Stream for TunnelBody {
 
                 match out {
                     Poll::Ready(Some(ChunkOrEnd::Chunk(b))) => {
+                        eprintln!("BODY poll_next -> Chunk {}B (total {}B)", b.len(), 0);
                         if let Ok(mut guard) = slot.lock() {
                             *guard = Some(taken);
                         }
@@ -91,7 +112,10 @@ impl Stream for TunnelBody {
                     // END or a closed channel means no more bytes. The receiver is
                     // deliberately NOT restored: leaving it gone makes any later
                     // poll end cleanly via the `None` arm above.
-                    Poll::Ready(Some(ChunkOrEnd::End)) | Poll::Ready(None) => Poll::Ready(None),
+                    Poll::Ready(Some(ChunkOrEnd::End)) | Poll::Ready(None) => {
+                        eprintln!("BODY poll_next -> END (terminates the caller's body)");
+                        Poll::Ready(None)
+                    }
                     Poll::Pending => {
                         if let Ok(mut guard) = slot.lock() {
                             *guard = Some(taken);
@@ -201,11 +225,6 @@ async fn handle(
             // 500 republished as a hub 200 would poison every caller's retry logic
             // (I-11: never invent an upstream answer).
             let head = forwarded.head().await;
-            let Some(rx) = forwarded.take_rx() else {
-                // Unreachable for a freshly forwarded stream; if it ever happens,
-                // 500 rather than inventing an upstream answer (I-11).
-                return Ok(error_response(StatusCode::INTERNAL_SERVER_ERROR));
-            };
             // No head means no upstream answer, and that is a FAILURE, reported as
             // one. This line was `unwrap_or(StatusCode::OK)`, which fabricated a
             // 200 for a response that never arrived -- verified by killing the
@@ -241,7 +260,7 @@ async fn handle(
             // 200 (I-11). hyper::Error has no public constructor, so the service
             // returns a Response rather than an Err.
             Ok(builder
-                .body(TunnelBody::live(rx))
+                .body(TunnelBody::from_forwarded(forwarded))
                 .unwrap_or_else(|_| error_response(StatusCode::INTERNAL_SERVER_ERROR)))
         }
         Err(e) => Ok(match e {
@@ -321,7 +340,7 @@ impl http_body::Body for TunnelBody {
             TunnelBody::Fixed(b) => b.is_empty(),
             // Conservative: a live stream might have bytes in flight, so never
             // claim EOF. Claiming it wrongly lets hyper answer with no body.
-            TunnelBody::Live(_) => false,
+            TunnelBody::Live(..) => false,
         }
     }
 }

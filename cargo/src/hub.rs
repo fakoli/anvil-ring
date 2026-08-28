@@ -470,6 +470,11 @@ impl Drop for StreamGuard {
     /// caller cannot leave a half-open stream consuming engine capacity. The
     /// channel sender drop also wakes anyone awaiting chunks.
     fn drop(&mut self) {
+        eprintln!(
+            "GUARD drop id={} completed={}",
+            self.id,
+            self.completed.load(std::sync::atomic::Ordering::Relaxed)
+        );
         self.streams.lock().unwrap().remove(&self.id);
         // A stream that already reached END is finished, not abandoned: sending
         // End here would abort the tether's read for a response that is still
@@ -862,11 +867,6 @@ async fn handle_tether(
                         }
                     }
                     Frame::Data { stream: id, bytes } => {
-                        eprintln!(
-                            "TRACE-DATA id={id} n={} head={}",
-                            bytes.len(),
-                            bytes.len().min(24)
-                        );
                         // Route only to a stream the HUB opened. Dropping anything
                         // else is what stops a tether injecting bytes into a
                         // request it never saw.
@@ -898,11 +898,6 @@ async fn handle_tether(
                                         v
                                     };
                                     if let Some((res, rest)) = parse_head(&bytes) {
-                                        eprintln!(
-                                            "TRACE REQPATH parse_head SUCCEEDED on DATA (head was unset): n={} rest={} -> rest is RAW ENGINE framing forwarded as body",
-                                            bytes.len(),
-                                            rest.len()
-                                        );
 
                                         *st.head.lock().unwrap() = Some(res);
                                         if !rest.is_empty()
@@ -952,7 +947,6 @@ async fn handle_tether(
                                         }
                                     }
                                 } else if st.chunks_tx().send(ChunkOrEnd::Chunk(Bytes::from(bytes))).await.is_err() {
-                                        eprintln!("TRACE FORWARD FAILED id={id} (caller channel closed)");
 
                                     // Caller vanished: close the stream at the tether.
                                     let _ = sink.send(ws_msg(Frame::End { stream: id, reason: Vec::new() })).await;
