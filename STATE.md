@@ -123,3 +123,22 @@ built WebSocket) or a fixture tether that exits without closing.
 
 `tests/i6_tether_death_probe.rs` covers ONLY the leaked-socket case (task aborted,
 sink retained by the writer task). Its docstring says so; keep it that way.
+
+## PANIC FIX: bare-LF header terminator underflowed `reframe_head_for_tunnel`
+
+A stale-tether panic report (`attempt to subtract with overflow`, src/tunnel.rs)
+was from an OLD binary (its `TT k=` trace string is not in HEAD source) -- but the
+same arithmetic existed at HEAD and was reproduced as a live crash.
+
+`find_header_end` matches `\r\n\r\n` (returns i+4) OR bare `\n\n` (returns i+2).
+`reframe_head_for_tunnel` sliced `&head[..end - 4]`, so a bare-LF head (end=2)
+underflowed and panicked. A panic here kills the tether worker and every stream
+multiplexed over the tunnel -- far worse than a wrong byte.
+
+Fix: only run the CRLF reframe when the terminator really is CRLF-CRLF; a bare-LF
+head passes through UNCHANGED (rewriting LF fields to CRLF could split a value
+containing a bare LF, so normalization would be wrong, not just risky).
+tests/bare_lf_head_panic_probe.rs pins both cases (2/2).
+
+Gate after the fix: 54 lib, forward_e2e 3/4 (I-6 only), proxy_e2e 5/5, live
+streaming 6/6 with `GUARD drop id=1 completed=true` after all six chunks.

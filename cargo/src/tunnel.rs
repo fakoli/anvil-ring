@@ -668,6 +668,20 @@ pub fn reframe_head_for_tunnel(head: &[u8]) -> Vec<u8> {
     let Some(end) = crate::hub::find_header_end(head) else {
         return head.to_vec();
     };
+    // A bare-LF terminator (`\n\n`) is a different shape than CRLF-CRLF and this
+    // function re-emits fields as CRLF lines; rewriting LF-delimited fields to
+    // CRLF could split a line whose value legitimately contains a bare LF. So a
+    // bare-LF head is passed through UNCHANGED -- the conservative answer -- and
+    // the caller's own hop-by-hop handling applies.
+    //
+    // This is also a correctness fix, not just a style choice: the block slice
+    // below is `end - 4`, and `find_header_end` returns `end = i + 2` for `\n\n`.
+    // A short bare-LF head (end < 4) underflowed and panicked the tether worker,
+    // taking down the whole tunnel. Reproduced by
+    // tests/bare_lf_head_panic_probe.rs.
+    if head.get(end.saturating_sub(4)..end) != Some(b"\r\n\r\n".as_slice()) {
+        return head.to_vec();
+    }
     // `find_header_end` returns the offset just PAST the blank line, so the
     // header block (status line + field lines) is everything before its final
     // CRLFCRLF. Getting this bound wrong by two bytes duplicated a CRLF and the
