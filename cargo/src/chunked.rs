@@ -563,3 +563,37 @@ mod multi_chunk_push_tests {
         assert!(done);
     }
 }
+
+#[cfg(test)]
+mod probe_single_chunk_tests {
+    use super::ChunkedDecoder;
+
+    /// THE decisive deterministic test for the truncation bug.
+    ///
+    /// The pump's coalesced path feeds ONLY the bytes after the head, i.e. one
+    /// well-formed chunk with NO terminating zero-size chunk:
+    ///
+    ///     "B\r\ndata: ev00\n\r\n"
+    ///
+    /// End of a chunked body is defined by a zero-size chunk and nothing else.
+    /// So `done` MUST be false here. Measured in the field, the pump treated
+    /// this as end-of-body and emitted a terminator, which the caller received
+    /// as a complete answer (`0\r\n\r\n`) while the engine still had 9 events
+    /// queued 3 seconds apart.
+    #[test]
+    fn one_well_formed_chunk_is_not_end_of_body() {
+        let mut d = ChunkedDecoder::new();
+        let r = d.push(b"B\r\ndata: ev00\n\r\n").expect("push");
+        println!(
+            "PROBE out={:?} done={}",
+            String::from_utf8_lossy(&r.out),
+            r.done
+        );
+        assert_eq!(r.out, b"data: ev00\n", "decoded payload");
+        assert!(
+            !r.done,
+            "BUG CONFIRMED: decoder reports end-of-body after one chunk \
+             with no zero-size terminator"
+        );
+    }
+}

@@ -952,6 +952,7 @@ async fn handle_tether(
                                         }
                                     }
                                 } else if st.chunks_tx().send(ChunkOrEnd::Chunk(Bytes::from(bytes))).await.is_err() {
+                                        eprintln!("TRACE FORWARD FAILED id={id} (caller channel closed)");
 
                                     // Caller vanished: close the stream at the tether.
                                     let _ = sink.send(ws_msg(Frame::End { stream: id, reason: Vec::new() })).await;

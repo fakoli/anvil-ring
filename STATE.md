@@ -180,6 +180,39 @@ next reader trusts.
 present -- it documents current behaviour, deliberately, and must be inverted
 when the head stops carrying the header.
 
+## TUNNEL STARVATION FIXED AND PROVEN (this turn)
+
+Head-to-head, identical code except the `biased` keyword in the stream pump's
+select!:
+    with `biased;`:   PUMP read k=96                      (exactly one read)
+    without `biased`: PUMP read k=96, 16, 16, 16, 16      (keeps reading)
+Both had the SAME `None => {}` no-op. Then the real fix - latch the arm off
+(`recv(), if !from_hub_done`, set `from_hub_done = true` on None), which stops a
+closed receiver from cancelling the read arm at all. Measured after that fix with
+a NEVER-FINISHING engine (10 events, 3 s apart):
+    hub received 10 of 10 DATA frames    (was: 1)
+    TRACE FORWARD FAILED: 0 occurrences
+
+So the tunnel now delivers the ENTIRE stream to the hub. The earlier
+"tether stops reading" symptom is closed, and the earlier "biased is irrelevant"
+conclusion I recorded was WRONG: biased made the starvation total rather than
+frequent. Corrected here rather than quietly.
+
+## REMAINING BUG: hub -> caller hop (separate, and now the only one)
+
+Caller still receives exactly one event plus a terminator, while the hub holds
+all 10 chunks and reports ZERO send failures. So bytes are delivered to the
+caller's channel and never reach the socket. Note on measurement: hyper writes
+the response in one 4 KB block, so head + first event + terminator arrive in a
+single recv() at t=0.0s -- earlier "terminator arrived before the engine emitted
+event two" reasoning was reading a COALESCED WRITE, not proof of fabrication.
+What remains provable is the byte count: one event, then end.
+
+Candidates, unranked until measured: `TunnelBody::poll_next` ending the stream
+early; the `Mutex<Option<Receiver>>` + `take()` handoff returning None on the
+second poll (i.e. the receiver is taken once and lost); the frontend's
+ChunkOrEnd::End handling; or a size/flush interaction with hyper.
+
 ## THE TERMINATOR IS FABRICATED (I-11 violation) - decisive test
 
 Engine rewritten to NEVER finish (10 events, 3 s apart). Caller still received:

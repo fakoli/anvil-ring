@@ -330,10 +330,35 @@ async fn run_session(
                                     let mut head_seen = false;
                                     // Latched once the request side reports None. See the
                                     // `from_hub` arm: that None is NOT end-of-stream.
+                                    //
+                                    // `from_hub` carries request bytes: the OPEN head, then
+                                    // DATA, and the hub drops its clone when the request is
+                                    // complete. So `recv()` yielding None is a NORMAL event --
+                                    // end of the request side -- not end of stream. Breaking on
+                                    // it aborts the engine read loop mid-answer (measured: zero
+                                    // bytes returned to the caller).
+                                    //
+                                    // It must not be a no-op `None => {}` either. The channel's
+                                    // final clone is dropped while this task is still pumping
+                                    // the answer, so a closed receiver is PERMANENTLY ready for
+                                    // the rest of the stream's life, and a ready arm CANCELS its
+                                    // siblings each pass -- which cancels the engine-read arm
+                                    // before it can do more than whatever the first read
+                                    // happened to coalesce. Measured with the SAME no-op None,
+                                    // varying only whether this select is `biased`:
+                                    //     biased:           PUMP read k=96               (one read, ever)
+                                    //     no biased:        PUMP read k=96, 16, 16, 16, 16
+                                    // Identical code otherwise. So `biased` decides whether the
+                                    // starvation is total (this arm always wins) or merely
+                                    // frequent (random polling lets the read arm make progress
+                                    // sometimes). Neither is correct; both are this bug.
+                                    //
+                                    // Correct shape: stop polling this arm once it is closed, so
+                                    // a ready-but-empty branch can never cancel the read arm.
+                                    let mut from_hub_done = false;
                                     loop {
                                         tokio::select! {
-                                            biased;
-                                            maybe = from_hub.recv() => match maybe {
+                                            maybe = from_hub.recv(), if !from_hub_done => match maybe {
                                                 // Half-close: no more request bytes. Shutdown
                                                 // the write half so the engine sees
                                                 // answer is still to come.
@@ -368,13 +393,22 @@ async fn run_session(
                                                 // receives exactly one event. Measured:
                                                 // this arm fired on every iteration.
                                                 //
-                                                // None is also NOT an abort -- the only
-                                                // sender is the session loop on another task,
-                                                // and a bodiless request never sends. So:
-                                                // do nothing. Not a `break` (kills the read)
-                                                // and not a latch (the transient sender makes
-                                                // a guarded arm re-enable and spin).
-                                                None => {}
+                                                // None is NOT an abort: the hub drops its
+                                                // sender clone once the request is complete,
+                                                // which is normal, and a bodiless request
+                                                // never sends at all. So no `break`.
+                                                //
+                                                // But it DOES mean this arm is closed forever,
+                                                // and a closed receiver is permanently ready --
+                                                // so keep polling it and every pass cancels
+                                                // `ctx.read` (see the measurement above).
+                                                // Disable the arm instead: the loop then waits
+                                                // on the read/heartbeat arms only, which is
+                                                // exactly right, because after half-close the
+                                                // only thing left to do is drain the engine.
+                                                None => {
+                                                    from_hub_done = true;
+                                                }
                                             },
                                             n = ctx.read(&mut buf) => match n {
                                                 Ok(0) => {
