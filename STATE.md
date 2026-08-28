@@ -84,22 +84,45 @@ Proof the fix works, instrumented hub, one run:
     H RECV DATA 10 bytes   (data: two)
     H RECV DATA 11 bytes   (data: done)
 
-Previously: only the 80-byte frame, ever.
+SEE CORRECTION BELOW: these four lines came from an interval containing several
+requests, not one response. The tunnel fix is real; the truncation is not solved.
 
-### Still failing: the hub receives all four frames; the caller gets 137 bytes
+### Still failing: the caller gets 137 bytes, and the hub receives ONE frame
 
-137 = head + `data: one`, in a single read. So the remaining fault is inside the
-hub's own DATA -> `ChunkOrEnd` -> `TunnelBody` routing, and it is now a small,
-well-bounded surface rather than a mystery. Candidates, in order:
+Instrumented run, one request, traced end to end:
 
-1. The hub treats the FIRST DATA frame as the head and only THEN starts
-   forwarding; if the first frame is consumed for head parsing and its `rest`
-   mishandled, early body bytes are lost while later ones should survive — but
-   the caller sees exactly ONE event, so look at what the frontend's `TunnelBody`
-   does after yielding the first chunk (the `ChunkOrEnd::Chunk` receiver may be
-   dropped or the stream ended after one item).
-2. `head()` polls `st.head()` with a bounded ~1s wait; confirm it is not also
-   cancelling/ending the body subscription.
+    HUBDATA frame 80 bytes, head_already=false
+    BODY yield 10 bytes
+    BODY end of stream
+
+One inbound frame (the head). The single yielded event comes from `parse_head`'s
+`rest`, i.e. the head frame's coalesced body bytes -- so the caller's 137 bytes
+are head + first event, and then the body ends.
+
+**Correction to the "proof" above:** the four `H RECV DATA` lines (80/10/10/11)
+were emitted across ~116s of hub uptime containing several requests, NOT in one
+response. Read as a single run they would have meant the tunnel was fixed; that
+claim was wrong and is retracted. The ping re-arm is still a genuine, necessary
+fix -- an idle tunnel demonstrably went silent and was torn down on a 6s
+watchdog -- but it did not resolve the truncation.
+
+The truncation is that the TETHER still sends only the head frame on the wire,
+even though the pump provably reads all four reads and de-chunks them (traced as
+`k=80 / k=15 / k=15 / k=16 / k=5`). Between "pump produced a payload" and "hub
+received a frame", the later frames vanish. The pump hands them to the session
+writer channel and `send` reports Ok; the writer reports no error; the peer
+never shows them.
+
+Two candidate mechanisms remain, and the next run should distinguish them:
+
+1. The pump's `reply` sender is a clone whose receiver is not the one the writer
+   drains after a reconnect — so accepted sends go into a dead channel. Check
+   sender/receiver identity at clone time vs. writer drain time.
+2. The stream task is torn down after the first send (guard drop -> `End` ->
+   `streams.remove`) so later reads never reach a live sender.
+
+Note `BODY end of stream` fires without any `Frame::End` arriving from the
+tether, which means the channel closed -- consistent with candidate 1.
 
 **The earlier hypothesis below is REFUTED — keep for history only.** It said the
 hub session loop died mid-stream. The session lifetime was a watchdog artifact of
