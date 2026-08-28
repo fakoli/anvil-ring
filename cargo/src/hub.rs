@@ -69,6 +69,11 @@ pub struct Lease {
 /// hub -> tether direction) can reach an established tunnel.
 #[derive(Clone)]
 struct LiveSession {
+    /// Distinct per authorized session, so an exiting session can tell whether the
+    /// registry still points at IT or at a successor that re-authorized under the
+    /// same tether id. Cloning a LiveSession shares this value; only a newly
+    /// authorized session gets a new one.
+    generation: u64,
     /// Write half. Requests the hub originates are pushed here and the session
     /// loop puts them on the wire.
     tx: mpsc::UnboundedSender<Frame>,
@@ -123,6 +128,8 @@ pub struct Registry {
     by_credential: Mutex<HashMap<String, String>>,
     by_id: Mutex<HashMap<String, Tether>>,
     live: Mutex<HashMap<String, LiveSession>>,
+    /// Monotonic per authorized session; see `LiveSession::generation`.
+    next_generation: std::sync::atomic::AtomicU64,
     lease: Duration,
 }
 
@@ -144,6 +151,7 @@ impl Registry {
             by_credential: Mutex::new(HashMap::new()),
             by_id: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
+            next_generation: std::sync::atomic::AtomicU64::new(1),
             lease: lease.max(Duration::from_secs(5)),
         }
     }
@@ -216,6 +224,9 @@ impl Registry {
 
     fn attach(&self, id: &str, tx: mpsc::UnboundedSender<Frame>) -> LiveSession {
         let session = LiveSession {
+            generation: self
+                .next_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             tx,
             last_seen: Arc::new(Mutex::new(Instant::now())),
             streams: Arc::new(Mutex::new(HashMap::new())),
@@ -243,8 +254,23 @@ impl Registry {
         session
     }
 
-    fn detach(&self, id: &str) {
-        self.live.lock().unwrap().remove(id);
+    /// Unregister `id` ONLY if the registered session is still this same session.
+    ///
+    /// A plain `remove(id)` is wrong whenever a tether re-authorizes: the NEW
+    /// session is installed under the same id, and when the OLD session's loop
+    /// finally exits it deletes the NEW, live one. That pulls a healthy tunnel
+    /// out of the routing table (callers get 502 NoTether) while the new session
+    /// -- nothing tells it -- stays connected but unroutable.
+    fn detach(&self, id: &str, session: &LiveSession) {
+        let mut live = self.live.lock().unwrap();
+        let owns_it = live
+            .get(id)
+            .map(|current| current.generation == session.generation)
+            .unwrap_or(false);
+        if owns_it {
+            live.remove(id);
+        }
+        // Otherwise a newer session owns this id and MUST keep it.
     }
 
     /// Forward a caller's request through a tether's tunnel and return a reader
@@ -998,7 +1024,7 @@ async fn handle_tether(
         }
     }
 
-    registry.detach(&lease.tether_id);
+    registry.detach(&lease.tether_id, &session);
     let kind = if revoked {
         EventKind::Revoked
     } else {

@@ -142,3 +142,40 @@ tests/bare_lf_head_panic_probe.rs pins both cases (2/2).
 
 Gate after the fix: 54 lib, forward_e2e 3/4 (I-6 only), proxy_e2e 5/5, live
 streaming 6/6 with `GUARD drop id=1 completed=true` after all six chunks.
+
+## Link stability: MEASURED steady state (my reset-frequency worry was wrong twice)
+
+A field log showed repeated `authorized -> Up -> reset -> authorized` cycles for one
+tether, which made me raise a "tunnels reset after seconds" concern. A 100 s soak
+(hub + tether, nothing killed, no requests) gives the answer:
+
+    1 authorization, 0 resets, 0 refusals, 0 dial failures, tunnel Up, all alive
+    VERDICT: STEADY STATE -- the link does not flap on its own.
+
+So those resets WERE teardown (harness pkill), as first claimed. The soak initially
+failed for reasons that were entirely harness bugs, and I proposed THREE wrong
+explanations before finding it:
+  1. "a stale /opt/homebrew/bin copy answered" -- FALSE: no such file exists.
+  2. "an old installed binary lacking hub/tether subcommands" -- FALSE: the binary at
+     the absolute path is current (`--help` lists all subcommands).
+  3. "a zombie bound the port and answered first" -- FALSE: the fixture binds WITHOUT
+     SO_REUSEADDR, so a successful bind proves the port was free.
+The real cause: the hub registers its demo tether from ANVIL_RING_DEMO_CREDENTIAL,
+and I dials with a DIFFERENT ANVIL_RING_CREDENTIAL. `refused tether` +
+`ended: unauthorized` was I-5 working correctly. I-8 (authorize never says which half
+was wrong) is why a credential typo is indistinguishable from a protocol bug -- which
+is ALSO why the soak must use ONE unique value for both sides and assert `tunnel
+reached Up` before interpreting any count.
+
+## Minor robustness fix (defect real, urgency lower than I first assumed)
+
+`Registry::detach(id)` was an unguarded `live.remove(id)`. On re-authorization the NEW
+session is installed under the same tether id, so when the OLD session's loop exits it
+deletes the NEW live session: a healthy tunnel left connected but unroutable (every
+caller gets 502 NoTether) with nothing to repair it, since the survivor is never told.
+Fixed with a per-session `generation` stamp and compare-before-remove.
+
+Corrected urgency: the soak shows re-authorization is rare in steady state, so this is
+a latent robustness fix, not the cause of the observed churn. Verified: 54 lib tests,
+forward_e2e 3/4 (only I-6), and detach cannot be covered by a direct unit test -- it is
+private and only reachable through a real re-auth race.
