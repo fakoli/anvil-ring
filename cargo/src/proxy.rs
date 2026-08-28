@@ -173,11 +173,27 @@ fn forward_uri(upstream: &hyper::Uri, req_uri: &hyper::Uri) -> Option<hyper::Uri
     format!("{scheme}://{authority}{path}{qs}").parse().ok()
 }
 
+/// The single definition of "loopback" for the whole crate (I-10).
+///
+/// Both the proxy and the tunnel consult this. Two definitions of a security
+/// boundary is how one of them ends up accepting `0.0.0.0`, `0177.0.0.1`, or a
+/// `*.localhost` name that resolves off-host.
+pub fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    if h == "localhost" || h.ends_with(".localhost") {
+        return true;
+    }
+    match h.parse::<std::net::IpAddr>() {
+        // `0.0.0.0` is NOT loopback: on Linux it is a bind-any wildcard, and
+        // connecting through it is a routable connection.
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        Err(_) => false,
+    }
+}
+
 fn is_loopback(uri: &hyper::Uri) -> bool {
-    matches!(
-        uri.host(),
-        Some("127.0.0.1") | Some("localhost") | Some("::1") | Some("[::1]")
-    )
+    uri.host().is_some_and(is_loopback_host)
 }
 
 async fn connect_loopback(host: &str) -> std::io::Result<TcpStream> {

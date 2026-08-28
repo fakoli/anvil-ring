@@ -20,7 +20,11 @@ hyper-util = { version = "0.1", features = ["tokio", "http1", "server", "server-
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
-futures-util = "0.3"
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+webpki-roots = "0.26"
+tokio-rustls = "0.26"
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
 
 # I-7: one static, self-contained artifact. Build for
 # aarch64-unknown-linux-musl / x86_64-unknown-linux-musl so the binary has no

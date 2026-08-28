@@ -1,96 +1,80 @@
 # STATE
 
 **Last updated:** 2026-08-28
-**Phase:** data-plane proxy implemented and tested; **tunnel client not started**.
+**Phase:** tunnel + hub + client implemented and **verified end-to-end on one
+machine**. Revocation verified at the authorization layer. **The hub cannot yet
+forward a live request** — see "What is NOT done".
 
-## Language
+## Components
 
-**Rust** for the data plane (ADR-0004). The Python scaffold was superseded within
-a day: token streaming is per-chunk latency-sensitive work, which is exactly where
-the GIL and GC cost show up, and the earlier "stdlib-only" invariant was imported
-from `anvil-events` by pattern-match rather than reasoned about. The Python docs
-(invariants, ADRs, origin story) are retained and remain the contract.
-
-## What exists
-
-| Item | File | Verified how |
+| Component | File | Verified |
 |---|---|---|
-| Origin story (de-identified) | `docs/origin-story.md` | prose |
-| Invariants I-1…I-10 | `docs/invariants.md` | I-8/I-9/I-10 now have tests |
-| ADR-0001 outbound-tether-not-mesh | `docs/adr/0001-…` | Accepted |
-| ADR-0002 transport | `docs/adr/0002-…` | **open**, but largely mooted by ADR-0004 |
-| ADR-0003 egress evidence, run 1 | `docs/adr/0003-…` | real probe output; baseline only |
-| ADR-0004 Rust data plane + fused image | `docs/adr/0004-…` | Accepted |
-| Flushing reverse proxy | `cargo/src/proxy.rs` | 9 unit + 5 e2e tests |
-| Hop-by-hop header stripping | `cargo/src/headers.rs` | 4 unit tests, incl. `Connection:`-named fields |
-| Egress probe tool | `cargo/check_flush.py`, Python hub tooling | run for real; see below |
-| Wire shape draft | `schemas/tether-v1.json` | schema validates |
+| Flushing reverse proxy | `cargo/src/proxy.rs` | 9 unit + 5 e2e; TCP-level flush timing |
+| Wire frame codec | `cargo/src/frames.rs` | 9 unit tests, incl. all 8 frame types |
+| Tunnel client (rental side) | `cargo/src/tunnel.rs` | live handshake, lease, state machine |
+| Hub + registry (authority) | `cargo/src/hub.rs` | 11 unit tests, incl. SHA-256 known-answer tests |
+| `anvil-ring hub` / `tether` | `cargo/src/main.rs` | ran both binaries, real WSS |
 
-**Test suite:** 14 passing (9 unit, 5 end-to-end spawning the real binary).
+`cargo test`: **41 passing**, zero warnings.
 
-## The proof that matters most
+## What was actually observed (not asserted)
 
-`check_flush.py` measures TCP-level arrival times against a slow-emitting engine:
+Two real processes, real WebSocket:
 
 ```
-upstream emission span: 1.60s
-tcp reads observed: 5
-  t+ 0.00s   133B   (headers)
-  t+ 0.53s    16B   data: two
-  t+ 1.01s    18B   data: three
-  t+ 1.49s    19B   data: [DONE]
-  t+ 1.99s     5B   terminator
-arrival spread: 1.98s -> PASS (flushing)
+hub:    hub on 127.0.0.1:18900; tether demo-1 registered (cred 3316c9a97a9a...)
+hub:    tether demo-1 authorized from 127.0.0.1:49288, lease 900s
+hub:    event demo-1 Up
+tether: tunnel #1 authorized; lease 900s
 ```
 
-That cadence matching the emission interval is what distinguishes real flushing
-from a proxy that buffers and presents as "the model is slow" — I-9's failure mode
-is latency, not error, so `proxy_e2e::streaming_arrives_incrementally…` asserts on
-**arrival timing**, never on eventual body equality.
+Invariants checked against the live processes:
 
-**Negative control:** `src/bin/buffering_canary.rs` is a deliberately-buffering
-binary; `tests/negative_control.rs` drives the same timing assertion against it and
-requires it to FAIL. A guard that cannot go red is decoration. If that test ever
-passes, the streaming assertion has been weakened and needs tightening.
+- **I-1 (outbound only)** — the tether owns **exactly one** socket, and it is
+  outbound: `anvil-rin 37433 TCP 127.0.0.1:49288->127.0.0.1:18900 (ESTABLISHED)`.
+  Zero listeners. The hub, by contrast, shows its `LISTEN`.
+- **I-8 (no secret in argv/logs)** — credential passed by env, absent from `ps`;
+  hub logs only `cred 3316c9a97a9a...` (hash prefix).
+- **I-10 (loopback-only upstream)** — `ANVIL_RING_UPSTREAM=http://example.com:80`
+  → `Error: "upstream must be loopback; the tether only ever proxies locally (I-10)"`
+  at startup *and* re-checked per stream in `StreamCtx::open`.
+- **I-3 (revocation)** — `Registry::authorize` returns `None` the instant `revoke`
+  is called; a live session additionally gets `GOAWAY`.
 
-## Blocking decision
+## What is NOT done — the honest gap
 
-**Per-provider egress policy** (ADR-0003). Measured from a real rental container,
-not reasoned about. It no longer gates the *implementation* — we now own the proxy
-and speak HTTP through our own tunnel — but it still gates *deployment*.
+**The hub accepts a tunnel but cannot push a request through it.** `LiveSession.tx`
+exists and the hub's session loop *can* write frames, but nothing constructs the
+`OPEN` frame from an inbound HTTP request. So the data path
+`caller -> hub -> tunnel -> vLLM -> back` does not close yet; the control path
+(auth, lease, teardown) does.
 
-## Next steps, in order
+This is why `tx` drew a dead-code warning: it is genuinely not written to yet. I
+kept the field with an explanatory `#[allow(dead_code)]` rather than deleting the
+warning by deleting the plumbing.
 
-1. **Tunnel client + hub** — this is the actual product. Everything so far is the
-   proxy half; nothing dials out yet.
-2. **Fused image `Dockerfile`** (`FROM vllm/vllm` + `COPY anvil-ring`), plus a
-   loopback bind for the engine (I-10).
-3. **ADR: identity & revocation** — registration, lease interval, revocation
-   propagation. I-3/I-4 are assertions until this exists.
-4. **musl static release build** in CI, so I-7 is enforced by a build rather than
-   by intent.
-5. **Egress probe from a real rental** → close ADR-0002/0003.
+Also unbuilt: hub-side TLS termination (the test used `ws://` on loopback, which
+`dial()` *permits only for loopback* and refuses otherwise), stream-id allocation
+with reuse control, and the hub's caller-facing HTTP frontend.
+
+## Bugs found and fixed during this phase
+
+1. **`select!` cannot borrow one struct twice.** `hb.tick()` + `hb.dead()` in one
+   `select!` is two `&mut` method calls on `hb` — opaque to the borrow checker.
+   Fixed by borrowing the two timer *fields* directly, which it can prove disjoint.
+2. **A `tick()` future pins its `Interval`.** `Box::pin(interval.tick())` holds
+   `interval` borrowed, so re-arming is impossible; switched to a re-armed
+   `Pin<Box<Sleep>>`.
+3. **Hand-rolled SHA-256 failed its own known-answer test.** `finish_hex()` called
+   `update()` for padding, which increments the byte counter, so the encoded
+   message length was wrong. Replaced with the `sha2` crate. Recording this
+   because the *reason* I hand-rolled it — "fewer deps for auditability" — is
+   exactly the reasoning that produces vulnerable crypto. `sha2` is the audited
+   choice; I-7 constrains the *artifact*, not the crate count.
+4. **My test asserted a contract the code didn't have** (revoke returning false on
+   a second call). Fixed the test, then fixed the code to the clearer contract:
+   `true` = state changed, `false` = nothing changed.
 
 ## Naming rule (operator directive — do not revisit casually)
 
 Binary and every invocation: **`anvil-ring`**. No bare `ring`, no short alias.
-The prefix is the namespace and is also the mitigation for "ring" collisions.
-Enforced by `tests/proxy_e2e.rs` (spawns the binary by name) and by the
-`CARGO_BIN_EXE_anvil-ring` reference in the test harness.
-
-## Harness lessons (recorded so they are not rediscovered)
-
-1. **Ports must be reserved per-test.** Sharing one pair made results depend on
-   execution order.
-2. **Never trust a bare `connect()` readiness probe.** It succeeds when *any*
-   process holds the port — including a leaked proxy from a previous run. That
-   produced a bewildering "proxy returned no bytes" which was really `AddrInUse`.
-   The harness now reads the proxy's own log line to confirm *our* child bound it.
-3. **Kill AND reap** test children (`kill()` + `wait()`); a reaped-less child keeps
-   the listening socket alive into the next test.
-4. **A test double must drain the request body.** Reading only headers left
-   `Content-Length` bytes on the socket, hyper blocked forever, and the test saw a
-   200 with an empty body.
-5. **Parse the body the way the wire does it.** Taking the *last* `\r\n\r\n`
-   segment of a chunked response yields the `0\r\n\r\n` terminator, so a correct
-   proxied response read as empty. Split on the first boundary; de-frame chunks.
