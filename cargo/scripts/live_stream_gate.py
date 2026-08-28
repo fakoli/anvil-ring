@@ -143,12 +143,25 @@ def main() -> int:
                             f"(got {len(texts)})")
         if not head_early:
             failures.append(f"head not 200 (got status {resp.status})")
-        if len(received) >= 3:
-            spread = received[-1][0] - received[0][0]
-            if spread < args.gap * (len(received) - 1) * 0.5:
-                failures.append(f"BUFFERED: {len(received)} events arrived in "
-                                f"{spread:.2f}s, expected >= "
-                                f"{args.gap * (len(received)-1):.2f}s of pacing")
+        # Pacing must be measured on DISTINCT arrival times, not on line count.
+        # One SSE event yields TWO lines here (the hex chunk length and the payload),
+        # both stamped at the same instant, so counting lines inflates n and made a
+        # correctly-streaming response look buffered. This false failure fired once.
+        stamps = sorted({round(t, 3) for t, _ in received})
+        data_stamps = sorted({round(t, 3) for t, s in received if s.startswith("data:")})
+        if len(data_stamps) >= 3:
+            spread = data_stamps[-1] - data_stamps[0]
+            need = args.gap * (len(data_stamps) - 1) * 0.5
+            if spread < need:
+                failures.append(
+                    f"BUFFERED: {len(data_stamps)} data events spread over "
+                    f"{spread:.2f}s, expected >= {need:.2f}s (gap={args.gap}s)")
+        elif len(data_stamps) >= 2:
+            spread = data_stamps[-1] - data_stamps[0]
+            if spread < args.gap * 0.5:
+                failures.append(f"BUFFERED: only {spread:.2f}s between first two "
+                                f"data events (gap={args.gap}s)")
+        _ = stamps
     except Exception as exc:  # noqa: BLE001 - report, do not mask
         failures.append(f"caller error: {type(exc).__name__}: {exc}")
 
