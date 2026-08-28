@@ -223,3 +223,26 @@ that tether) rather than queueing toward an engine that cannot answer. Response
 bytes already bound correctly (`StreamState.chunk_tx` is a bounded `mpsc::Sender`,
 and `pending` holds body bytes so a caller cannot outrun the tunnel) -- the gap is
 only the outbound command direction.
+
+## Confirmed design intent (operator, 2026-08-28): drop-and-redial is the design
+
+Asked whether hub<->tunnel resets are routine in the fleet (which would shape how
+strict the I-6 fix must be), the answer is: **no problem to design around -- the
+tunnel is meant to drop and redial, and a redial is a normal, correct event.**
+
+Two consequences the I-6 fix must respect:
+
+1. Do NOT add reconnect damping, backoff growth, or 'too many reconnects -> alarm'
+   logic. Backoff exists only for the DIAL side (tunnel.rs BACKOFF_MIN..MAX) and is
+   correct there; do not extend that idea to session teardown.
+2. Because re-authorization is EXPECTED to be routine, the `detach` clobber is more
+   important than my soak implied. I downgraded it to 'latent' after measuring one
+   authorization per 100s idle soak -- but that soak had no reason to reconnect, so
+   it measured an idle tunnel, not a reconnecting one. Every real reconnect hits
+   exactly the path where an old session's exit deletes the new live session under
+   the same tether id. Keep the generation guard, and step 1 of the plan should show
+   a RECONNECT (not just a teardown) leaving the tunnel routable.
+
+Still worth a live check when convenient: how often the fleet's tethers actually
+redial, so the reconnect path gets proportional test coverage. The soak script
+(/tmp/soak_tunnel.py) is the tool; it asserted steady state on an idle tunnel.
