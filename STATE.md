@@ -270,10 +270,10 @@ idle tunnel has no reason to reconnect -- so do not read its verdict as "reconne
 rare in production". That misread is what made me downgrade the detach clobber to
 "latent" (corrected in the section above).
 
-## OPERATOR RULE (absolute): never touch ai-mbp25
+## OPERATOR RULE (absolute): never touch the operator's daily-driver host
 
 Restated by the operator twice, so it is recorded here as well as in agent memory:
-**ai-mbp25 is OFF LIMITS to me entirely.** No SSH to it, nothing read from it, nothing
+**the operator's daily-driver host is OFF LIMITS to me entirely.** No SSH to it, nothing read from it, nothing
 run on it — no builds, containers, processes, config changes, probing, or read-only
 "quick tests". It is the operator's active Mac and it HOSTS FLEET SERVICES (Docker
 Desktop: serving containers, the Hermes gateway/dashboard, n8n app + postgres, webui),
@@ -283,7 +283,7 @@ Consequences for this project:
 - Do NOT propose mbp25 as a linux/amd64 / musl / `docker buildx` release-build host.
   That idea is explicitly rejected, not merely deferred.
 - Do NOT install colima on Mini either (it cannot emulate x86_64).
-- All anvil-ring build/test work stays on fakoli-mini (arm64) under ~/workspace-work.
+- All anvil-ring build/test work stays on the build host (arm64) under ~/workspace-work.
   That means debug/CLI/test work only. A real linux/amd64 release artifact has NO
   authorized build host right now: if one is ever needed, STOP and ask the operator
   where it happens rather than picking a machine.

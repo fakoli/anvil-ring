@@ -87,7 +87,7 @@ TCP, the hub cannot see death, and steps 2-4 have nothing to react to.
   wrong until I checked).
 
 ## Boundaries
-- Build/test ONLY on this host (Fakoli Mini, arm64). Do NOT touch ai-mbp25 in any form —
+- Build/test ONLY on this host (the build host (arm64)). Do NOT touch the operator's daily-driver host in any form —
   it hosts fleet services and the n8n repo. If a linux/amd64 release artifact is needed,
   STOP and ask where it gets built; do not install colima (arm64 can't emulate x86_64).
 - n8n / the CVE item: the operator's call, not mine. Do not open it.
