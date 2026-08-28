@@ -862,6 +862,11 @@ async fn handle_tether(
                         }
                     }
                     Frame::Data { stream: id, bytes } => {
+                        eprintln!(
+                            "TRACE-DATA id={id} n={} head={}",
+                            bytes.len(),
+                            bytes.len().min(24)
+                        );
                         // Route only to a stream the HUB opened. Dropping anything
                         // else is what stops a tether injecting bytes into a
                         // request it never saw.
@@ -893,7 +898,11 @@ async fn handle_tether(
                                         v
                                     };
                                     if let Some((res, rest)) = parse_head(&bytes) {
-                                    eprintln!("HUBDATA parse={} first32={:?}", true, String::from_utf8_lossy(&bytes[..bytes.len().min(32)]));
+                                        eprintln!(
+                                            "TRACE REQPATH parse_head SUCCEEDED on DATA (head was unset): n={} rest={} -> rest is RAW ENGINE framing forwarded as body",
+                                            bytes.len(),
+                                            rest.len()
+                                        );
 
                                         *st.head.lock().unwrap() = Some(res);
                                         if !rest.is_empty()

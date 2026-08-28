@@ -180,6 +180,43 @@ next reader trusts.
 present -- it documents current behaviour, deliberately, and must be inverted
 when the head stops carrying the header.
 
+## FINDINGS (this turn) - MEASURED, both ends of the tunnel
+
+Tether (verified-live stack, one hub, one tether, one fake engine, lsof-checked):
+  T RESP_HEAD send raw=80 fixed=52
+      fixed = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n"   <- CORRECT: TE removed
+  PUMP read k=95        <- EXACTLY ONE READ. Ever.
+  Engine socket afterwards: our side FIN_WAIT_2, fake's side CLOSE_WAIT.
+
+Caller receives:
+  head: HTTP/1.1 200 OK | x-trace-marker: frontend-live-7q | content-type |
+        transfer-encoding | date
+  body: A\r\ndata: one\n\r\n0\r\n\r\n          <- ONE event + terminator
+
+The marker header PROVES the current frontend served this request (it was added
+this turn and is present on the wire). `date:` and `transfer-encoding:` are
+hyper-synthesized, not engine-supplied -- the engine sends neither.
+
+REFUTED THIS TURN, each by measurement rather than argument:
+  1. "tether stops reading the engine"  - true observation, but it is CONSEQUENCE:
+     k=95 = 80 head + 15 (one chunk). The fake engine's `while True: recv()` then
+     ATE events two/three as a second request. One read is the bug, not the engine.
+  2. "request-path parse_head leaks raw rest as body" - TRACE REQPATH fired ZERO times.
+  3. "stale binary / stale listener answers the caller" - full `rm -rf target`
+     reproduced byte-identical output; `lsof` shows exactly one LISTEN, seconds old.
+  4. "chunk sent before caller installs receiver, send() errs and kills stream"
+     - caller idled 2s reading nothing; nothing was buffered in the kernel, so the
+     bytes never reached the frontend. Loss is upstream of the frontend.
+
+PRIMARY SUSPECT, now with socket evidence: the pump exits after ONE read. The
+stream task's select! has exactly two arms (from_hub.recv, ctx.read). A CLOSED
+mpsc Receiver's recv() is permanently ready (tokio docs: "When a channel is
+closed, recv() returns with None"), and `biased;` is in effect, so the from_hub
+arm can win every pass and cancel ctx.read forever. I previously changed its None
+arm to a no-op, which does NOT remove the permanent readiness -- only the guard
+did that, and the guard was deleted as itself faulty. The two facts to reconcile:
+whether the stream task survives read #1, and who half-closed the engine socket.
+
 Proven correct in isolation, so stop re-testing these: `parse_head` returns the
 body after the head with headers ending once (`parse_head_rest_tests`);
 `TunnelBody::poll_next` returns its receiver on both Chunk and Pending; the chunk

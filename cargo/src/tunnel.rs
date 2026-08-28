@@ -402,6 +402,7 @@ async fn run_session(
                                                     break;
                                                 }
                                                 Ok(k) => {
+                                                    eprintln!("PUMP read k={k}");
                                                     // Decide on the FIRST read, from the head
                                                     // we already have: only a chunked body gets
                                                     // decoded. A plain content-length body must
@@ -443,6 +444,12 @@ async fn run_session(
                                                             // bytes too -- the normal production case, since
                                                             // a model flushes headers before its first token.
                                                             let fixed = reframe_head_for_tunnel(&raw);
+                                                            eprintln!(
+                                                                "T RESP_HEAD send raw={} fixed={} full={:?}",
+                                                                raw.len(),
+                                                                fixed.len(),
+                                                                String::from_utf8_lossy(&fixed)
+                                                            );
                                                             if reply.send(msg(Frame::RespHead { stream: id, head: fixed })).is_err() { break; }
                                                             if crate::chunked::is_chunked(head.headers()) {
                                                                 // The decision, made once. Note

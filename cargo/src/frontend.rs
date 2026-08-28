@@ -222,8 +222,13 @@ async fn handle(
             let Some(head) = head else {
                 return Ok(error_response(caller_status_for(None)));
             };
-            let mut builder =
-                Response::builder().status(caller_status_for(Some(head.status().as_u16())));
+            // EXPERIMENT: a marker proving which code path built this response.
+            // If this header reaches the caller, the response came from HERE and
+            // the raw head in the body was produced by code below this point.
+            // If it is absent, this function never served the request.
+            let mut builder = Response::builder()
+                .header("x-trace-marker", "frontend-live-7q")
+                .status(caller_status_for(Some(head.status().as_u16())));
             for (name, value) in head.headers() {
                 // Hop-by-hop must not cross this hop; copying blindly would
                 // reintroduce e.g. transfer-encoding, which we strip and re-frame.
