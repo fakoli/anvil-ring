@@ -225,10 +225,15 @@ tether's tunnels with it. Blast radius is the whole fleet, not one call.
 
 That makes a bounded command channel part of the I-6 fix, not a later hardening
 step: bound it, and refuse new streams when full (fail the caller fast with 503 on
-that tether) rather than queueing toward an engine that cannot answer. Response
-bytes already bound correctly (`StreamState.chunk_tx` is a bounded `mpsc::Sender`,
-and `pending` holds body bytes so a caller cannot outrun the tunnel) -- the gap is
-only the outbound command direction.
+that tether) rather than queueing toward an engine that cannot answer.
+Response direction VERIFIED bounded in BOTH of its hops (grep, not inference):
+  - hub.rs:324 `mpsc::channel::<ChunkOrEnd>(64)` -- per-stream, capacity 64
+  - hub.rs:101/484 `chunk_tx: mpsc::Sender<ChunkOrEnd>` (not Unbounded)
+  - and `pending` holds body bytes so a caller cannot outrun the tunnel
+A stalled caller therefore applies backpressure the whole way back instead of
+buffering. The gap is ONLY the outbound command direction (hub.rs:79
+`UnboundedSender`). So step 3 is ONE channel, not a redesign: bound
+`LiveSession.tx`, refuse new streams when full, leave the response path alone.
 
 ## Confirmed design intent (operator, 2026-08-28): drop-and-redial is the design
 
