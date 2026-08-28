@@ -111,3 +111,15 @@ actually writes, with timestamps), `/tmp/reuse_test.py` (id reuse).
 - probe tests: `sender_teardown_probe`, `hub_to_caller_body`, `hyper_body_probe`,
   `chunk_backpressure_probe`, `coalesced_head_probe` — each is a proof of innocence
   for a component; keep them, they are cheap and they encode real contracts.
+
+## COVERAGE GAP (do not read the probe suite as covering this)
+The crashed-process case -- both socket halves gone, peer receives a real RST -- is
+NOT tested. It IS detected: the hub logs 'Connection reset without closing
+heartbeat', and after the `decode` fix an unexpected message is terminal rather
+than swallowed. But the probe cannot exercise it, because `run_client` owns the
+connection and the test harness cannot force SO_LINGER=0 / hard-close that socket.
+Closing that gap needs either a test hook in `run_client` (e.g. accept an already
+built WebSocket) or a fixture tether that exits without closing.
+
+`tests/i6_tether_death_probe.rs` covers ONLY the leaked-socket case (task aborted,
+sink retained by the writer task). Its docstring says so; keep it that way.

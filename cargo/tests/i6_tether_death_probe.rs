@@ -97,7 +97,18 @@ async fn caller_terminates_within_the_liveness_window() {
     let mut got = vec![0u8; 64];
     let _ = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut got)).await;
 
-    // Kill the tether's task but NOT its socket (the writer task keeps the sink).
+    // Kill the tether's task. Its writer task keeps the sink half alive (the
+    // socket was split in run_client), so the TCP connection SURVIVES -- which is
+    // the case this probe exists to characterize.
+    //
+    // NOT COVERED HERE, and deliberately so: the crashed-process case, where both
+    // socket halves go away and the peer gets a real RST. That path IS detected --
+    // the hub logs 'Connection reset without closing handshake' and, since the
+    // decode fix, treats it as terminal rather than swallowing it. A test for it
+    // needs control of the client socket (e.g. SO_LINGER=0 on drop), which this
+    // harness cannot reach because run_client owns the connection. Wiring that up
+    // is worth doing before claiming RST coverage; until then this file should not
+    // be read as covering it.
     tether.abort();
     drop(tether);
 
