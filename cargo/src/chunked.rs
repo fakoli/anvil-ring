@@ -358,3 +358,122 @@ mod wire_shape_tests {
         assert!(!r.done);
     }
 }
+
+#[cfg(test)]
+mod coalesced_read_tests {
+    use super::*;
+
+    /// An engine that flushes fast (or a coalescing loopback socket) delivers
+    /// several chunks in ONE read. One `push` must yield ALL of them.
+    ///
+    /// This is the property whose absence looked exactly like "the tunnel streams
+    /// the first token and stops": with three events in one read, a decoder that
+    /// emitted only the first left two events silently discarded, and every
+    /// consumer downstream -- hub, frontend, caller -- faithfully forwarded the
+    /// truncated answer, so nothing downstream looked wrong.
+    #[test]
+    fn one_push_emits_every_chunk_in_a_coalesced_read() {
+        let mut d = ChunkedDecoder::new();
+        // Three chunks, byte counts 10, 10, 11 -- matching the fake engine.
+        let all = b"a\r\ndata: one\n\r\na\r\ndata: two\n\r\nb\r\ndata: done\n\r\n0\r\n\r\n";
+        let r = d.push(all).expect("valid chunked stream");
+        assert_eq!(
+            r.out,
+            b"data: one\ndata: two\ndata: done\n",
+            "coalesced read lost events: got {:?}",
+            String::from_utf8_lossy(&r.out)
+        );
+        assert!(
+            r.done,
+            "the last-chunk marker in this read must be reported"
+        );
+    }
+
+    /// Same payload split at awkward boundaries -- a chunk straddling two reads and
+    /// a size line straddling two more. Loss must not depend on where reads land.
+    #[test]
+    fn arbitrary_read_boundaries_lose_nothing() {
+        // "Done" is deliberately NOT required to wait for all 51 bytes. At offset 49
+        // the input ends `...\r\n0\r\n` -- the last-chunk size line without its
+        // trailing CRLF -- and the decoder correctly reports Done there, because a
+        // zero-length chunk IS the end of the body; those final two CRLF bytes carry
+        // no body content (RFC 9112 §7.1). Demanding them instead would make
+        // end-of-body detection depend on a flush some engines never send, stalling a
+        // response that is actually finished.
+        //
+        // This loop asserts only what a single cut can establish: the exact byte
+        // sequence, and that no cut produces a truncated body. It deliberately does
+        // NOT assert anything about WHEN Done fires. An earlier version asserted that
+        // Done implies the prefix ends at `0\r\n` and failed at cut=50, whose prefix
+        // ends with a LONE `0` -- the CRLF was in the second read, so the decoder had
+        // no choice but to wait. Done can legitimately depend on bytes held by the
+        // other read, which makes it a property of the pair, not of either cut.
+        // `last_chunk_size_line_alone_ends_the_body` tests Done where it can be
+        // stated honestly.
+        let all: Vec<u8> =
+            b"a\r\ndata: one\n\r\na\r\ndata: two\n\r\nb\r\ndata: done\n\r\n0\r\n\r\n".to_vec();
+        const BODY: &[u8] = b"data: one\ndata: two\ndata: done\n";
+        let mut done_early = 0usize;
+        for cut in 1..all.len() {
+            let mut d = ChunkedDecoder::new();
+            let mut got = Vec::new();
+            let r1 = d
+                .push(&all[..cut])
+                .unwrap_or_else(|e| panic!("cut {cut}: {e:?}"));
+            got.extend_from_slice(&r1.out);
+            if r1.done {
+                done_early += 1;
+            } else {
+                let r2 = d
+                    .push(&all[cut..])
+                    .unwrap_or_else(|e| panic!("cut {cut} tail: {e:?}"));
+                got.extend_from_slice(&r2.out);
+                assert!(r2.done, "never saw the end when split at {cut}");
+            }
+            assert_eq!(got, BODY, "split at {cut} lost or reordered bytes");
+        }
+        // The loop must actually have exercised that boundary rather than passing
+        // because it never reached it.
+        assert!(
+            done_early > 0,
+            "expected at least one boundary where Done is reached before all bytes"
+        );
+    }
+
+    /// The last-chunk marker ends the body as soon as its size-line CRLF is seen,
+    /// without waiting for the trailer CRLF. Pinned so that a change which starts
+    /// demanding those extra bytes is read as re-introducing a stall, not as a fix.
+    #[test]
+    fn last_chunk_size_line_alone_ends_the_body() {
+        let mut d = ChunkedDecoder::new();
+        let r = d
+            .push(b"a\r\ndata: one\n\r\n0\r\n")
+            .expect("valid through the last-chunk marker");
+        assert_eq!(r.out, b"data: one\n");
+        assert!(
+            r.done,
+            "the last-chunk size line ends the body; its trailing CRLF is not needed"
+        );
+        // Whatever arrives afterwards must not be parsed as another chunk.
+        let r2 = d.push(b"\r\n").expect("trailing CRLF is inert");
+        assert!(r2.out.is_empty(), "bytes invented after Done: {:?}", r2.out);
+    }
+
+    /// And it genuinely waits when even the size-line CRLF is missing: a lone `0`
+    /// is not a complete chunk-size line, and decoding it as one would end the body
+    /// on a fragment. The pair of tests is the point -- end on the marker, never on
+    /// a partial one.
+    #[test]
+    fn a_lone_zero_digit_does_not_end_the_body() {
+        let mut d = ChunkedDecoder::new();
+        let r = d.push(b"a\r\ndata: one\n\r\n0").expect("partial input is fine");
+        assert_eq!(r.out, b"data: one\n");
+        assert!(
+            !r.done,
+            "a size line with no terminator is not yet a last-chunk marker"
+        );
+        let r2 = d.push(b"\r\n\r\n").expect("the completing bytes");
+        assert!(r2.done, "the completed marker must finally end the body");
+        assert!(r2.out.is_empty(), "no body bytes remain to emit");
+    }
+}
