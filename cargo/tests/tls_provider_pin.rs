@@ -85,7 +85,10 @@ fn aws_lc_is_absent_from_the_lockfile() {
     );
     // Positive control: the lockfile is real and non-trivial, so the assert above is
     // not passing because the file is empty or truncated.
-    assert!(text.contains("name = \"rustls\""), "unexpected lockfile shape");
+    assert!(
+        text.contains("name = \"rustls\""),
+        "unexpected lockfile shape"
+    );
     let n = text.matches("name = ").count();
     assert!(n > 40, "lockfile looks truncated: only {n} packages");
     println!("resolved graph has {n} packages, none of them aws-lc");
