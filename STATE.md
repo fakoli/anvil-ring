@@ -141,6 +141,45 @@ distinct defects, previously conflated:
 2. After `rest` is sent once, later frames stop reaching the hub. That part is
    still unexplained and is what the remaining failing e2e tests exercise.
 
+### ROOT CAUSE (measured, arithmetic, not inference)
+
+Engine emits 131 bytes for this response:
+    80 (head) + 51 (three events + terminator)
+The caller received **137**. Six bytes MORE than the engine ever produced, so
+`transfer-encoding: chunked` was applied a SECOND time, on top of bytes that were
+already chunk-coded. A proxy cannot invent bytes; only hyper's framing can. That
+requires the head reaching the caller to still say `transfer-encoding: chunked`
+while the body it carries is already framed.
+
+That is the hop-by-hop decision made backwards, in this project's own code, for
+BOTH directions, and it was never executed anywhere:
+
+  * `strip_hop_by_hop` in headers.rs has ZERO call sites (verified by grep).
+    Comments in tunnel.rs and STATE.md claim the tether strips the header before
+    forwarding a head. It never has. I asserted this in several comments without
+    checking -- a comment describing code that does not exist.
+  * Tether -> caller: forwarding the engine's head VERBATIM, header included, is
+    right ONLY if the body is forwarded verbatim too. The tether de-chunks, so the
+    header now lies, and the hub re-frames the de-chunked bytes: +6 bytes, and
+    chunk framing visible in the body.
+  * Caller -> tether -> engine: the caller's `transfer-encoding` is forwarded to
+    the engine, which will chunk-decode a request body that was never framed --
+    the mirror-image bug.
+
+The fix is asymmetric and must be made in BOTH directions, in the tether (the
+component that changes a body's framing is the component that owns the header):
+  - response head to the hub: strip `transfer-encoding` (we de-chunked).
+  - request head to the engine: strip it, and forward a body framed the way the
+    head now claims, or strip it only when we pass the body through untouched.
+Do NOT fix it by de-chunking at the hub: hop-by-hop is per-hop, and the hub has
+already re-framed by then. Also wire up `strip_hop_by_hop` or delete it -- dead
+code that comments claim is live is worse than no code, because it is what the
+next reader trusts.
+
+`hub_forwards_rest_verbatim_and_therefore_leaks_framing` PASSES while the bug is
+present -- it documents current behaviour, deliberately, and must be inverted
+when the head stops carrying the header.
+
 Proven correct in isolation, so stop re-testing these: `parse_head` returns the
 body after the head with headers ending once (`parse_head_rest_tests`);
 `TunnelBody::poll_next` returns its receiver on both Chunk and Pending; the chunk

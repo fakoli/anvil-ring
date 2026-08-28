@@ -500,7 +500,7 @@ async fn run_session(
                                                 }
                                             }
                                             let payload = match &mut dechunk {
-                                                None => buf[..k].to_vec(),
+None => buf[..k].to_vec(),
                                                 Some(d) => match d.push(&buf[..k]) {
                                                     Ok(r) => r.out,
                                                     Err(e) => {

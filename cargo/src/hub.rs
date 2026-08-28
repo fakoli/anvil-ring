@@ -1134,3 +1134,37 @@ mod parse_head_rest_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod coalesced_rest_is_framed_tests {
+    use super::*;
+
+    /// THIS TEST PASSES WHILE THE BUG IS PRESENT: it documents current
+    /// behaviour, it does not endorse it. Flip the assertions when the tether
+    /// stops preserving `transfer-encoding` on the head it forwards -- the fix
+    /// -- and this becomes a regression test.
+    ///
+    /// If the hub forwards `parse_head`'s `rest` verbatim, the caller sees the
+    /// ENGINE's chunk framing as its body. That is the shape observed on the
+    /// wire, so pin what verbatim forwarding produces and what de-chunking
+    /// SHOULD produce, to show which one the hub actually does today.
+    #[test]
+    fn hub_forwards_rest_verbatim_and_therefore_leaks_framing() {
+        let wire = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\na\r\ndata: one\n\r\n0\r\n\r\n";
+        let (res, rest) = parse_head(wire).expect("parses");
+        // What the hub currently sends when it forwards `rest` unchanged:
+        assert_eq!(
+            rest.as_ref(),
+            b"a\r\ndata: one\n\r\n0\r\n\r\n",
+            "rest still carries chunk framing"
+        );
+        // The hub has NO de-chunk step on this path, so the caller would receive
+        // framing. De-chunking is the TETHER's job; this asserts the hub does
+        // not do it, which is the defect this test documents.
+        let mut d = crate::chunked::ChunkedDecoder::new();
+        let out = d.push(&rest).expect("decodes").out;
+        assert_eq!(out, b"data: one\n", "what the caller SHOULD have gotten");
+        // The head still says chunked, so hyper re-frames an already-framed body.
+        assert!(crate::chunked::is_chunked(res.headers()));
+    }
+}
