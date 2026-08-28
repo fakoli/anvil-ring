@@ -43,6 +43,21 @@ jobs:
         with:
           workspaces: cargo
 
+      # A build script in the dependency tree compiles C via cc-rs, which looks for
+      # <arch>-linux-musl-gcc -- not the host cc. Ubuntu runners ship neither the
+      # cross gcc nor a musl libc for it, so musl builds fail with
+      #   cc-rs: failed to find tool "aarch64-linux-musl-gcc"
+      # musl-tools provides musl-gcc plus the libc; the symlink gives cc-rs the
+      # arch-prefixed name it actually asks for. (Caught by the first real CI run:
+      # both matrix legs failed here identically, so it was toolchain, not config.)
+      - name: Install musl cross toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools
+          sudo ln -sf "$(command -v musl-gcc)" "/usr/local/bin/${{ matrix.arch }}-linux-musl-gcc"
+          "${{ matrix.arch }}-linux-musl-gcc" --version | head -1
+
       - name: Build (release, locked)
         working-directory: cargo
         run: cargo build --release --locked --target ${{ matrix.target }} --bin anvil-ring
