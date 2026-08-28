@@ -22,8 +22,30 @@ http-body-util = "0.1"
 bytes = "1"
 futures-util = { version = "0.3", features = ["sink"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
-webpki-roots = "0.26"
-tokio-rustls = "0.26"
+# 1.x, not the 0.26 tokio-tungstenite would otherwise resolve: 0.26 enables rustls'
+# `aws_lc_rs`, while 1.x is pure data with NO features (verified against the registry),
+# so pinning here lets feature unification drop aws-lc from the whole graph. Without it
+# the two versions coexist and aws-lc-sys stays in -- which is what broke musl CI.
+webpki-roots = "1"
+# The ACTUAL enabler: tokio-rustls' default features turn on rustls' `aws_lc_rs`, so
+# pinning `rustls` alone could never drop aws-lc -- the enabler was this line. Must
+# carry the same provider set as the rustls pin below; keep the two in lockstep.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+# TLS provider: select `ring` explicitly and drop rustls' default `aws_lc_rs`.
+#
+# Why: aws-lc-sys assembles vendored ARM asm (s2n-bignum) with the target `as`, and
+# musl-tools' binutils rejects it -- "aes-xts-enc.S:601: Error: expecting operand
+# after ','". That is a toolchain-version incompatibility, so it fails in CI and in the
+# alpine Docker builder alike, independent of our code. `ring` is the supported
+# alternative and prebuilt-nasm only ever covered x86_64, never aarch64.
+#
+# Pin rustls' FEATURES, not merely add our own: a direct dependency can only ADD
+# features unless it sets default-features = false, which is what cargo's unification
+# then respects. `prefer-post-quantum` implies `aws_lc_rs`, so defaults must go.
+# PITFALL: an outbound client needs one process-level CryptoProvider. `ring` MUST stay
+# selected or connect() panics at RUNTIME while compiling and linking perfectly -- so
+# this is covered by tests/tls_provider_pin.rs, not by a comment.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
 httparse = "1.10.1"
 http-body = "1"
@@ -31,6 +53,12 @@ http-body = "1"
 # I-7: one static, self-contained artifact. Build for
 # aarch64-unknown-linux-musl / x86_64-unknown-linux-musl so the binary has no
 # dynamic dependencies and nothing must be installed on the rental host.
+[dev-dependencies]
+# tests/tls_provider_pin.rs inspects rustls' resolved provider. Same provider pin as
+# the dependency above, so the test can never pass under a different provider than the
+# one shipped.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
 [profile.release]
 opt-level = 2
 strip = true
