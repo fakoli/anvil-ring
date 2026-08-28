@@ -80,7 +80,6 @@ impl Stream for TunnelBody {
                 // poll_recv is the receiver's own poll. It returns Ready(None)
                 // only once the channel is closed AND drained, which is a real end.
                 let out = Pin::new(&mut taken).poll_recv(cx);
-                eprintln!("FE poll_recv -> {}", match &out { std::task::Poll::Ready(Some(ChunkOrEnd::Chunk(b))) => format!("CHUNK {} bytes {:?}", b.len(), String::from_utf8_lossy(&b[..b.len().min(40)])), std::task::Poll::Ready(Some(ChunkOrEnd::End)) => "END".into(), std::task::Poll::Ready(None) => "CHANNEL-CLOSED".into(), std::task::Poll::Pending => "Pending".into() });
 
                 match out {
                     Poll::Ready(Some(ChunkOrEnd::Chunk(b))) => {

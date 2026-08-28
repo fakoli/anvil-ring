@@ -333,7 +333,7 @@ async fn run_session(
                                     loop {
                                         tokio::select! {
                                             biased;
-                                            maybe = async { let v = from_hub.recv().await; eprintln!("SELECT from_hub -> {:?}", v.as_ref().map(|b| b.len())); v } => match maybe {
+                                            maybe = from_hub.recv() => match maybe {
                                                 // Half-close: no more request bytes. Shutdown
                                                 // the write half so the engine sees
                                                 // answer is still to come.
@@ -402,7 +402,6 @@ async fn run_session(
                                                     break;
                                                 }
                                                 Ok(k) => {
-                                                    eprintln!("PUMP READ k={k}");
                                                     // Decide on the FIRST read, from the head
                                                     // we already have: only a chunked body gets
                                                     // decoded. A plain content-length body must
