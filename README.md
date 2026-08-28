@@ -48,10 +48,16 @@ Read [docs/origin-story.md](docs/origin-story.md) for the reasoning, and
 |---|---|
 | Design contract, invariants, ADR-0001 | ✅ written |
 | Egress probe tool (`anvil-ring probe-egress`) | ✅ built, run, evidence recorded (ADR-0003) |
-| Registration + token lifecycle | ⬜ not started |
-| Transport (chisel vs. `ssh -R`) | ⚠️ **undecided** — ADR-0002, needs one probe *from a rental* |
-| Hub (macOS/launchd + container) | ⬜ not started |
-| Working end-to-end test | ⬜ not started |
+| Registration + token lifecycle | ✅ built — credential-hashed registration, lease, generation-guarded detach |
+| Transport | ✅ WebSocket tunnel over TLS (a `wss://` hub is enforced for non-loopback); the ADR-0002 chisel-vs-`ssh -R` question is now moot, and one probe *from a rental* is still owed |
+| Hub (macOS/launchd + container) | ✅ hub + caller frontend built; deployment packaging not done |
+| Working end-to-end test | ✅ `forward_e2e` / `proxy_e2e` / `soak_tunnel.py` green; one red test is open defect **I-6** (below), not a gap in coverage |
+
+The Rust implementation lives in [`cargo/`](cargo/) — build, test, and harness notes in
+[`cargo/README.md`](cargo/README.md). Known-open defect: **I-6**, a caller whose tether
+dies mid-stream is never terminated (measured: the hub *does* observe the death, 3/3;
+the caller is ended, 0/3). Diagnosis, measurements, and the staged fix are in
+[`STATE.md`](STATE.md) and [`docs/i6-step1-measured.md`](docs/i6-step1-measured.md).
 
 ## License
 
