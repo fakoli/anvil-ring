@@ -128,6 +128,11 @@ Also fixed while investigating, and it stays fixed: `decode` used to return
 look like a keepalive and the loop spin on a dead socket. Now terminal.
 
 ## Test topology currently in use
+CANONICAL GATE (committed, reboot-safe): `cargo/scripts/live_stream_gate.py`
+regenerates the whole topology and asserts no-truncation, head-first-from-engine,
+and not-buffered. Run: `python3 cargo/scripts/live_stream_gate.py`. Prefer this
+over the /tmp scratch probes below, which are ephemeral and will not survive a
+reboot (they are kept only as history of what was measured).
 engine `spyengine.py` :19905 -> tether -> hub :19920 (frontend :19922), credential
 `tun`, caller token `cal`. `/tmp/caller_paced.py` (timing truth),
 `/tmp/caller_total.py` (drain-to-EOF count), `/tmp/spyengine.py` (what the engine
