@@ -870,7 +870,6 @@ async fn handle_tether(
                             }
                             Some(st) => {
                                 if st.head.lock().unwrap().is_none() {
-                                eprintln!("HUBDATA arrived len={} buffered_so_far={}", bytes.len(), st.pending_head.lock().unwrap().len());
 
                                     // The first chunk carries the engine's status
                                     // line; the tether forwarded raw HTTP bytes.

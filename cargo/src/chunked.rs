@@ -523,3 +523,43 @@ mod composed_path_tests {
         assert!(!r.done, "more events follow");
     }
 }
+
+#[cfg(test)]
+mod multi_chunk_push_tests {
+    use super::*;
+
+    /// THE shape the tether hands the decoder on a coalesced read: several events
+    /// and the terminator in ONE buffer. If push() stops at the first chunk, the
+    /// caller sees one token and a stream that never finishes -- which is exactly
+    /// the observed live symptom, and no existing test covered it.
+    #[test]
+    fn one_push_decodes_every_chunk_in_the_buffer() {
+        let buf = b"a\r\ndata: one\n\r\na\r\ndata: two\n\r\nb\r\ndata: done\n\r\n0\r\n\r\n";
+        let mut d = ChunkedDecoder::new();
+        let r = d.push(buf).expect("decodes");
+        assert_eq!(
+            r.out, b"data: one\ndata: two\ndata: done\n",
+            "push must drain the whole buffer, not stop at the first chunk"
+        );
+        assert!(r.done, "the terminator was in this buffer");
+    }
+
+    /// Same buffer, but pushed in one-byte pieces: the result must be identical.
+    #[test]
+    fn byte_at_a_time_agrees_with_one_big_push() {
+        let buf = b"a\r\ndata: one\n\r\na\r\ndata: two\n\r\nb\r\ndata: done\n\r\n0\r\n\r\n";
+        let mut big = ChunkedDecoder::new();
+        let whole = big.push(buf).expect("ok").out;
+
+        let mut small = ChunkedDecoder::new();
+        let mut acc = Vec::new();
+        let mut done = false;
+        for i in 0..buf.len() {
+            let r = small.push(&buf[i..i + 1]).expect("ok");
+            acc.extend_from_slice(&r.out);
+            done = r.done;
+        }
+        assert_eq!(acc, whole, "byte-wise must match whole-buffer");
+        assert!(done);
+    }
+}

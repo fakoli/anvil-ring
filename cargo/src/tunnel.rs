@@ -328,16 +328,12 @@ async fn run_session(
                                     let mut dechunk: Option<crate::chunked::ChunkedDecoder> = None;
                                     // Set once the engine's response head has been examined.
                                     let mut head_seen = false;
-                                    // Engine response head, withheld until we know whether
-        // this body gets de-chunked. Sent once, reframed.
-                                    let mut withheld_head: Option<Vec<u8>> = None;
                                     // Latched once the request side reports None. See the
                                     // `from_hub` arm: that None is NOT end-of-stream.
-                                    let mut request_side_idle = false;
                                     loop {
                                         tokio::select! {
                                             biased;
-                                            maybe = from_hub.recv(), if !request_side_idle => match maybe {
+                                            maybe = from_hub.recv() => match maybe {
                                                 // Half-close: no more request bytes. Shutdown
                                                 // the write half so the engine sees
                                                 // answer is still to come.
@@ -359,29 +355,20 @@ async fn run_session(
                                                 // tear down a stream whose answer is fine.
                                                 Some(_) => {}
                                                 // Hub aborted, or the stream map dropped us.
-                                                None => {
-                                                    // NOT an abort. This receiver yields None
-                                                    // whenever no SENDER exists right now,
-                                                    // which is the NORMAL state: the only
-                                                    // holder of the sender is the session loop
-                                                    // on another task, and a GET with no
-                                                    // request body never sends anything.
-                                                    //
-                                                    // Breaking here was a real bug. This arm
-                                                    // is biased ahead of `ctx.read`, and the
-                                                    // loop also holds a short sleep arm, so
-                                                    // this branch wins repeatedly against an
-                                                    // engine answering ~300ms away -- and
-                                                    // dropping the `ctx.read` future CANCELS an
-                                                    // in-flight read. The visible symptom was
-                                                    // exactly one forwarded event per response.
-                                                    //
-                                                    // Disabling the arm (rather than breaking)
-                                                    // keeps the engine read in flight AND keeps
-                                                    // the idle timeout, which is the sleep
-                                                    // arm's whole purpose.
-                                                    request_side_idle = true;
-                                                }
+                                                // A closed receiver is PERMANENTLY ready.
+                                                // With `biased` this arm therefore STARVES
+                                                // `ctx.read` forever: the engine read is
+                                                // cancelled on every pass and the caller
+                                                // receives exactly one event. Measured:
+                                                // this arm fired on every iteration.
+                                                //
+                                                // None is also NOT an abort -- the only
+                                                // sender is the session loop on another task,
+                                                // and a bodiless request never sends. So:
+                                                // do nothing. Not a `break` (kills the read)
+                                                // and not a latch (the transient sender makes
+                                                // a guarded arm re-enable and spin).
+                                                None => {}
                                             },
                                             n = ctx.read(&mut buf) => match n {
                                                 Ok(0) => {
@@ -440,8 +427,15 @@ async fn run_session(
                                                         if !head_seen {
                                                             head_seen = true;
                                                             let raw = buf[..k - body.len()].to_vec();
-                                                            // Decide framing, then release the head WITHOUT that header.
-                                                            withheld_head = Some(raw.clone());
+                                                            // Release the head NOW, reframed, before any
+                                                            // body byte goes out. `transfer-encoding` is
+                                                            // dropped because we are about to de-chunk: a
+                                                            // header describing framing we remove makes the
+                                                            // hub re-frame already-bare bytes.
+                                                            //
+                                                            // This runs for a head arriving with NO body
+                                                            // bytes too -- the normal production case, since
+                                                            // a model flushes headers before its first token.
                                                             let fixed = reframe_head_for_tunnel(&raw);
                                                             if reply.send(msg(Frame::RespHead { stream: id, head: fixed })).is_err() { break; }
                                                             if crate::chunked::is_chunked(head.headers()) {
@@ -458,21 +452,12 @@ async fn run_session(
                                                                 // every body read to forward raw
                                                                 // chunk framing.
                                                                 dechunk = Some(crate::chunked::ChunkedDecoder::new());
-                                                                // Forward the engine's head VERBATIM as
-                                                                // the first DATA frame, THEN the decoded
-                                                                // body separately.
-                                                                //
-                                                                // This is not cosmetic. The hub's session
-                                                                // loop recognises the first chunk by
-                                                                // successfully parsing a status line out of
-                                                                // it, and only then treats later chunks as
-                                                                // body. Sending decoded body first makes
-                                                                // parse_head return None, and the hub's
-                                                                // "not a head yet" branch drops the chunk --
-                                                                // silently, for every chunk of the response.
-                                                                // That was the final link in a chain of four
-                                                                // bugs, all of which presented as "caller
-                                                                // receives an empty 200".
+                                                                // The head is NOT sent here. It went out
+                                                                // above as RespHead, reframed. What follows
+                                                                // is body bytes only: the hub's data path now
+                                                                // treats every DATA frame as body, so there is
+                                                                // no longer any status-line-vs-body guessing to
+                                                                // get wrong.
                                                                 // Decode the WHOLE remainder of
                                                                 // this read, not one chunk.
                                                                 //
@@ -802,7 +787,10 @@ mod reframe_head_tests {
         let (res, rest) = crate::hub::parse_head(&out).expect("must still parse");
         assert_eq!(res.status(), hyper::StatusCode::OK);
         assert!(rest.is_empty());
-        assert!(!crate::chunked::is_chunked(res.headers()), "still claims chunked");
+        assert!(
+            !crate::chunked::is_chunked(res.headers()),
+            "still claims chunked"
+        );
     }
 
     /// `gzip, chunked` is not ours to rewrite: we did not decode the gzip, and
