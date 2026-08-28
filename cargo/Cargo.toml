@@ -22,8 +22,22 @@ http-body-util = "0.1"
 bytes = "1"
 futures-util = { version = "0.3", features = ["sink"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
-webpki-roots = "0.26"
-tokio-rustls = "0.26"
+# TLS provider: select `ring` explicitly and drop rustls' default `aws_lc_rs`.
+# tokio-tungstenite's transitive tokio-rustls/rustls dependencies have defaults off;
+# this direct rustls dependency supplies the ONE production provider. Do not add a
+# direct tokio-rustls dependency with defaults on -- that was the actual aws-lc enabler.
+#
+# Why: aws-lc-sys assembles vendored ARM asm (s2n-bignum) with the target `as`, and
+# musl-tools' binutils rejects it -- "aes-xts-enc.S:601: Error: expecting operand
+# after ','". That is a toolchain-version incompatibility, so it fails in CI and in the
+# alpine Docker builder alike, independent of our code. `ring` is the supported
+# alternative and prebuilt-nasm only ever covered x86_64, never aarch64.
+#
+# Pin rustls' FEATURES, not merely add our own: `prefer-post-quantum` implies
+# `aws_lc_rs`, so defaults must go. PITFALL: an outbound client needs one process-level
+# CryptoProvider. `ring` MUST stay selected or connect() panics at RUNTIME while
+# compiling/linking perfectly -- covered by tests/tls_provider_pin.rs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
 httparse = "1.10.1"
 http-body = "1"
