@@ -333,7 +333,7 @@ async fn run_session(
                                     loop {
                                         tokio::select! {
                                             biased;
-                                            maybe = from_hub.recv() => match maybe {
+                                            maybe = async { let v = from_hub.recv().await; eprintln!("SELECT from_hub -> {:?}", v.as_ref().map(|b| b.len())); v } => match maybe {
                                                 // Half-close: no more request bytes. Shutdown
                                                 // the write half so the engine sees
                                                 // answer is still to come.
@@ -353,6 +353,12 @@ async fn run_session(
                                                 // more anyway. Ignored rather than written: a
                                                 // write here would error on a shut socket and
                                                 // tear down a stream whose answer is fine.
+                                                // Sender still alive after our half-close:
+                                                // the request body is finished, so late
+                                                // bytes are a hub fault. Drop them with a
+                                                // log -- do NOT write to a socket we shut
+                                                // down, which would error and tear down a
+                                                // stream whose response is fine.
                                                 Some(_) => {}
                                                 // Hub aborted, or the stream map dropped us.
                                                 // A closed receiver is PERMANENTLY ready.
@@ -396,6 +402,7 @@ async fn run_session(
                                                     break;
                                                 }
                                                 Ok(k) => {
+                                                    eprintln!("PUMP READ k={k}");
                                                     // Decide on the FIRST read, from the head
                                                     // we already have: only a chunked body gets
                                                     // decoded. A plain content-length body must

@@ -458,9 +458,10 @@ pub struct StreamGuard {
     chunk_tx: mpsc::Sender<ChunkOrEnd>,
     /// Set when the answer reaches END, so Drop knows not to abort.
     ///
-    /// Read in `StreamGuard::drop`; annotated because the compiler cannot see a
-    /// read that lives in a Drop impl for this type's own field.
-    #[allow(dead_code)]
+    /// Read in `StreamGuard::drop`. Deliberately NOT `#[allow(dead_code)]`:
+    /// that attribute silenced the one warning that would have reported this
+    /// field unread, which is how "Drop must not abort a completed stream"
+    /// came to be documented and never implemented.
     completed: Arc<AtomicBool>,
 }
 
@@ -470,6 +471,12 @@ impl Drop for StreamGuard {
     /// channel sender drop also wakes anyone awaiting chunks.
     fn drop(&mut self) {
         self.streams.lock().unwrap().remove(&self.id);
+        // A stream that already reached END is finished, not abandoned: sending
+        // End here would abort the tether's read for a response that is still
+        // arriving. Skip the abort; the deregistration above is enough.
+        if self.completed.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let _ = self.tx.send(Frame::End {
             stream: self.id,
             reason: Vec::new(),
