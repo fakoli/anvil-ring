@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 #[tokio::test(flavor = "current_thread")]
 async fn live_body_forwards_every_chunk_before_end() {
     let (tx, rx) = mpsc::channel::<ChunkOrEnd>(64);
-    let body = TunnelBody::live(rx);
+    let body = TunnelBody::live_for_test(rx);
 
     // Mirror what the hub does on receipt of each DATA frame, then END.
     tokio::spawn(async move {
@@ -51,7 +51,7 @@ async fn live_body_forwards_every_chunk_before_end() {
 #[tokio::test(flavor = "current_thread")]
 async fn live_body_streams_chunks_that_arrive_later() {
     let (tx, rx) = mpsc::channel::<ChunkOrEnd>(64);
-    let body = TunnelBody::live(rx);
+    let body = TunnelBody::live_for_test(rx);
 
     let producer = tokio::spawn(async move {
         for i in 0..5u32 {

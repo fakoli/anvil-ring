@@ -65,26 +65,39 @@ since `a1a07a2`.
   its full stream after caller A abandoned). Worth hardening (unregister by identity,
   not key), not urgent.
 
-## REMAINING FAILURE: `tether_death_midstream_ends_the_caller` (I-6)
-`assert!(matches!(ended, Ok(true)), "caller must be terminated when its tether
-dies, not left streaming")` fails; the loop hits `total > 100_000`.
+## REMAINING FAILURE: I-6 -- FULLY CHARACTERIZED (not a test artifact)
 
-The engine in that test streams `5\r\ndata:\r\n` forever; the tether is aborted;
-the caller must reach an end. Before the fix the caller's stream was torn down
-early, so it "ended" trivially and the test passed for the wrong reason. Now the
-body is kept alive — so this test is exercising the real path and something is
-still wrong with the abort path.
+`tests/i6_tether_death_probe.rs` measures it. After killing the tether's task:
+**bytes kept arriving for 65 s (3,287 B)** and the caller never terminated.
 
-Two candidate causes, NOT yet distinguished:
-1. Real defect: a dead tether leaves the caller's stream open, and something
-   regenerates data forever, so the caller never terminates. I-6 violation.
-2. Test artifact: the engine emits every 100 ms with no bound, so a correctly
-   streaming caller legitimately reads >100 KB and the assertion is over
-   strict.
+Mechanism: `tunnel::run_client` does `ws.split()` (tunnel.rs:175), so the writer
+task owns the socket's sink half. Cancelling the client task leaves the TCP
+connection OPEN, so the hub keeps reading -- the engine's PONGs refresh
+`last_seen`, so the 45s liveness watchdog can never fire, because from the hub's
+side the tether really IS alive. My cleanup sits at the session loop's exit, which
+this path never reaches (instrumented: 74x `stream.next -> Some(Ok(..))`, never
+None/Err, and `I-6 teardown:` never printed).
 
-Measure before changing either. Also note a possibly separate defect visible in
-the hub log during this test: `Connection reset without closing handshake` on
-tether teardown.
+**Real defect: a wedged tether can stream to a caller indefinitely, because its
+liveness proof is satisfied by traffic it is not processing.** In the fleet that
+is a GPU rental whose tunnel is alive-but-stuck while the engine behind it is
+gone -- the caller should be cut off, not fed.
+
+Design fix, NOT yet implemented (do not rush it):
+1. Keepalive must prove the peer is PROCESSING, not merely reachable. Ignore Pong
+   for liveness, or require a bidirectional proof (hub Ping -> tether Pong within
+   one interval) rather than counting any inbound byte.
+2. Close the socket deterministically when the tether's session is ending: join or
+   abort the writer task and drop the sink, so a leaked half cannot keep the
+   connection alive.
+3. Then end every stream that tether was serving (the drain already written at the
+   loop exit handles that once the exit is reachable).
+4. Add an explicit `tether_gone` signal so the frontend can end callers without
+   waiting on the watchdog at all.
+
+Also fixed while investigating, and it stays fixed: `decode` used to return
+`Ok(None)` for `Message::Text`/`Message::Frame`, which would have made a real RST
+look like a keepalive and the loop spin on a dead socket. Now terminal.
 
 ## Test topology currently in use
 engine `spyengine.py` :19905 -> tether -> hub :19920 (frontend :19922), credential

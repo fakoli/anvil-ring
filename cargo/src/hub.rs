@@ -969,6 +969,35 @@ async fn handle_tether(
         }
     };
 
+    // The tether is gone. Every stream it was serving must be ended for its
+    // caller, or that caller waits forever on a channel whose senders are all
+    // still alive -- the session loop is this task, so nothing else can wake it.
+    //
+    // Measured before this existed: after `tether.abort()`, the caller read 797
+    // bytes and then hung for the full 15s timeout. `StreamGuard::drop` cannot
+    // cover this, because it only runs when the CALLER goes away; this is the
+    // upstream dying, which is the case I-6 is about.
+    //
+    // Order matters: mark each stream completed so its guard will not try to
+    // abort a tether that is already gone, then unregister (dropping the state
+    // releases its sender), then hand the caller an explicit End. End is sent
+    // last so a caller that was parked wakes with a clean end-of-body rather than
+    // seeing the channel close out from under it.
+    {
+        let abandoned: Vec<(u16, Arc<StreamState>)> = {
+            let mut map = streams.lock().unwrap();
+            map.drain().map(|(id, st)| (id, st)).collect()
+        };
+        for (_id, st) in abandoned {
+            st.completed
+                .store(true, std::sync::atomic::Ordering::Release);
+            let tx = st.chunks_tx();
+            // try_send, not send: the caller may already be gone, and awaiting
+            // here would stall tether teardown behind a dead reader.
+            let _ = tx.try_send(ChunkOrEnd::End);
+        }
+    }
+
     registry.detach(&lease.tether_id);
     let kind = if revoked {
         EventKind::Revoked
@@ -995,9 +1024,20 @@ fn decode(
             let (frame, _n) = Frame::decode(b)?.ok_or("short tunnel frame")?;
             Ok(Some(frame))
         }
-        Message::Ping(_) | Message::Pong(_) | Message::Text(_) => Ok(None),
+        // Only Ping/Pong are ignorable: they are keepalives with no bearing on a
+        // stream's fate.
+        //
+        // `Text` and `Frame` must NOT be ignored. A peer that dies without a close
+        // handshake (RST) surfaces here, and this arm used to return Ok(None) for
+        // it -- the loop then `continue`d and called `next()` on a dead socket,
+        // spinning without ever ending its streams. Measured: 75 iterations, then
+        // the caller hung for the full 15s timeout with the tether already gone.
+        // Treating anything unexpected as terminal is what makes I-6 hold; the
+        // alternative is a silently wedged session.
+        Message::Ping(_) | Message::Pong(_) => Ok(None),
+        Message::Text(_) => Err("peer sent Text; tunnel frames are binary".into()),
         Message::Close(_) => Err("peer sent Close".into()),
-        Message::Frame(_) => Ok(None),
+        Message::Frame(_) => Err("peer sent a raw frame we cannot classify".into()),
     }
 }
 

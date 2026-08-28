@@ -34,7 +34,7 @@ pub enum TunnelBody {
     /// body ends early while looking complete. See `Forwarded::into_body`.
     Live(
         Arc<Mutex<Option<mpsc::Receiver<ChunkOrEnd>>>>,
-        Arc<crate::hub::Forwarded>,
+        Arc<dyn Send + Sync>,
     ),
     Fixed(Bytes),
 }
@@ -46,6 +46,19 @@ impl TunnelBody {
     /// stream registration and channel sender alive until the body is drained.
     pub fn live(rx: mpsc::Receiver<ChunkOrEnd>, stream: Arc<crate::hub::Forwarded>) -> Self {
         TunnelBody::Live(Arc::new(Mutex::new(Some(rx))), stream)
+    }
+
+    /// Body over a bare channel, for tests that exercise the CHANNEL/BODY contract
+    /// with no tunnel attached.
+    ///
+    /// Deliberately separate from `live`: production must go through
+    /// `from_forwarded`, because a body whose stream can be dropped underneath it
+    /// is exactly the bug that truncated every response -- the last sender died
+    /// while the body was still being read, and the body then ended looking
+    /// complete. Nothing built here keeps a stream registered, so nothing should
+    /// mistake this for the real path.
+    pub fn live_for_test(rx: mpsc::Receiver<ChunkOrEnd>) -> Self {
+        TunnelBody::Live(Arc::new(Mutex::new(Some(rx))), Arc::new(()))
     }
 
     /// Convenience: consume the forwarded stream into its own body, so the

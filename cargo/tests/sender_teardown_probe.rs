@@ -37,7 +37,7 @@ async fn dropping_all_senders_ends_the_stream_and_loses_queued_chunks() {
     // No END, just the senders going away -- what `StreamGuard::drop` produces.
     drop(tx);
 
-    let body = anvil_ring::frontend::TunnelBody::live(rx);
+    let body = anvil_ring::frontend::TunnelBody::live_for_test(rx);
     let mut got: Vec<String> = Vec::new();
     let mut stream = body;
     while let Some(item) = stream.next().await {

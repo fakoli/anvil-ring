@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 #[tokio::test(flavor = "current_thread")]
 async fn live_body_must_not_end_while_data_is_still_queued() {
     let (tx, rx) = mpsc::channel::<ChunkOrEnd>(64);
-    let body = TunnelBody::live(rx);
+    let body = TunnelBody::live_for_test(rx);
 
     // Producer is ALREADY DONE before the consumer starts: everything is queued.
     drop(tx);
@@ -49,7 +49,7 @@ async fn all_queued_chunks_come_out_in_order_before_end() {
     tx.send(ChunkOrEnd::End).await.unwrap();
     drop(tx);
 
-    let body = TunnelBody::live(rx);
+    let body = TunnelBody::live_for_test(rx);
     let mut got: Vec<String> = Vec::new();
     let mut stream = body;
     while let Some(item) = stream.next().await {
