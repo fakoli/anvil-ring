@@ -179,3 +179,25 @@ Corrected urgency: the soak shows re-authorization is rare in steady state, so t
 a latent robustness fix, not the cause of the observed churn. Verified: 54 lib tests,
 forward_e2e 3/4 (only I-6), and detach cannot be covered by a direct unit test -- it is
 private and only reachable through a real re-auth race.
+
+## I-6 DESIGN INPUT (measured, not assumed): the hub->tether command path is UNBOUNDED
+
+Confirmed by grep, not inference:
+  - hub.rs:79  `LiveSession.tx: mpsc::UnboundedSender<Frame>`   (hub -> tether commands)
+  - hub.rs:772 `mpsc::unbounded_channel::<Frame>()`             (per-session)
+  - tunnel.rs:176/216 unbounded writer task + per-stream senders on the tether side
+
+Consequence for I-6: a tether that is connected-but-not-processing (the measured
+65-seconds-of-streaming case) also means every OPEN/HEAD/BODY frame the hub pushes
+into `LiveSession.tx` queues in hub RAM with NO ceiling. So the wedged-tether defect
+is not only "a caller is never cut off" -- it is unbounded hub memory growth per
+wedged tether. In the fleet: one rental whose loop wedges while callers keep
+requesting can grow hub memory until the hub process dies, taking every OTHER
+tether's tunnels with it. Blast radius is the whole fleet, not one call.
+
+That makes a bounded command channel part of the I-6 fix, not a later hardening
+step: bound it, and refuse new streams when full (fail the caller fast with 503 on
+that tether) rather than queueing toward an engine that cannot answer. Response
+bytes already bound correctly (`StreamState.chunk_tx` is a bounded `mpsc::Sender`,
+and `pending` holds body bytes so a caller cannot outrun the tunnel) -- the gap is
+only the outbound command direction.
