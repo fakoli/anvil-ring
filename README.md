@@ -21,9 +21,13 @@ The executable is `anvil-ring`, always with the `anvil-` prefix. There is no bar
 the collision avoidance.
 
 ```bash
-anvil-ring up --serve http://127.0.0.1:8000   # on the rental host
-anvil-ring list                               # on your network
-anvil-ring call my-rental -- curl -s /v1/models
+# On the rental host -- dials OUT, listens on nothing (I-1).
+anvil-ring up --serve http://127.0.0.1:8000
+
+# On the hub side -- run over SSH or an existing private-network session, so the
+# hub itself never opens an inbound port to the internet either.
+ssh <hub> anvil-ring list
+ssh <hub> anvil-ring call my-rental -- curl -s /v1/models
 ```
 
 ## Why not just join the tailnet
