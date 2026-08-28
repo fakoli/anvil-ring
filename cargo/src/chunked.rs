@@ -481,7 +481,7 @@ mod coalesced_read_tests {
 }
 
 #[cfg(test)]
-mod composed_path_tests  {
+mod composed_path_tests {
     use super::*;
 
     /// THE shape the live engine actually puts on the wire for an SSE response:

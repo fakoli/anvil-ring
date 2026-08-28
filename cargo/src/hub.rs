@@ -816,6 +816,44 @@ async fn handle_tether(
                     Frame::Hello { .. } | Frame::Welcome { .. } => {
                         break Err("unexpected HELLO/WELCOME mid-session".into());
                     }
+                    Frame::RespHead { stream: id, head } => {
+                        // The tether's response head, already reframed: any
+                        // `transfer-encoding` the tether consumed is gone, so the
+                        // body arriving in DATA frames needs re-framing here and
+                        // must NOT be forwarded verbatim. Carrying the head in its
+                        // own frame is what makes that unambiguous -- the hub never
+                        // has to guess whether the first chunk is a head, which is
+                        // how a raw status line ended up in the caller's body.
+                        let target = streams.lock().unwrap().get(&id).cloned();
+                        let Some(st) = target else { continue };
+                        match parse_head(&head) {
+                            Some((res, rest)) => {
+                                if rest.is_empty() {
+                                    // Normal: head alone, body arrives as DATA.
+                                }
+                                *st.head.lock().unwrap() = Some(res);
+                                // `rest` is body bytes that came WITH the head; the
+                                // head frame must not swallow them.
+                                if !rest.is_empty()
+                                    && st.chunks_tx().send(ChunkOrEnd::Chunk(rest)).await.is_err()
+                                {
+                                    let _ = sink.send(ws_msg(Frame::End { stream: id, reason: Vec::new() })).await;
+                                }
+                            }
+                            None => {
+                                // A head the hub cannot parse is a protocol fault at
+                                // the far hop. Fail the stream loudly rather than
+                                // letting the caller hang (I-11: no silent 200).
+                                eprintln!("anvil-ring hub: stream {id} head unparseable");
+                                let _ = sink
+                                    .send(ws_msg(Frame::End {
+                                        stream: id,
+                                        reason: b"unparseable engine head".to_vec(),
+                                    }))
+                                    .await;
+                            }
+                        }
+                    }
                     Frame::Data { stream: id, bytes } => {
                         // Route only to a stream the HUB opened. Dropping anything
                         // else is what stops a tether injecting bytes into a
@@ -832,7 +870,8 @@ async fn handle_tether(
                             }
                             Some(st) => {
                                 if st.head.lock().unwrap().is_none() {
-                                
+                                eprintln!("HUBDATA arrived len={} buffered_so_far={}", bytes.len(), st.pending_head.lock().unwrap().len());
+
                                     // The first chunk carries the engine's status
                                     // line; the tether forwarded raw HTTP bytes.
                                     // Any bytes buffered from an earlier unparsable
@@ -848,6 +887,7 @@ async fn handle_tether(
                                         v
                                     };
                                     if let Some((res, rest)) = parse_head(&bytes) {
+                                    eprintln!("HUBDATA parse={} first32={:?}", true, String::from_utf8_lossy(&bytes[..bytes.len().min(32)]));
 
                                         *st.head.lock().unwrap() = Some(res);
                                         if !rest.is_empty()

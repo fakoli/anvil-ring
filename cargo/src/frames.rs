@@ -51,6 +51,13 @@ pub const T_GOAWAY: u8 = 0x08;
 /// streaming the answer. Distinct from END ("I am gone"), because aborting a
 /// request and finishing one both happen, and conflating them truncates the answer.
 pub const T_HALF_END: u8 = 0x09;
+/// An engine's response head, carried separately from the body. The tether cannot
+/// know whether a body is chunk-coded until it has SEEN the body, and it must not
+/// forward a `transfer-encoding` header for framing it is about to remove -- so
+/// the head is withheld until the decision is made. Without this frame type the
+/// only options were "send a possibly-lying head early" or "send the head as a
+/// body chunk", and the second one puts the raw status line in the caller's body.
+pub const T_RESP_HEAD: u8 = 0x0A;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -67,6 +74,12 @@ pub enum Frame {
     Data {
         stream: u16,
         bytes: Vec<u8>,
+    },
+    /// Engine response head. Sent at most once per stream, before any DATA, and
+    /// already reframed: any framing header the tether consumed is gone.
+    RespHead {
+        stream: u16,
+        head: Vec<u8>,
     },
     End {
         stream: u16,
@@ -89,6 +102,7 @@ impl Frame {
             Frame::Hello { .. } => T_HELLO,
             Frame::Welcome { .. } => T_WELCOME,
             Frame::Open { .. } => T_OPEN,
+            Frame::RespHead { .. } => T_RESP_HEAD,
             Frame::Data { .. } => T_DATA,
             Frame::End { .. } => T_END,
             Frame::Ping => T_PING,
@@ -100,9 +114,10 @@ impl Frame {
 
     pub fn stream(&self) -> u16 {
         match self {
-            Frame::Open { stream, .. } | Frame::Data { stream, .. } | Frame::End { stream, .. } => {
-                *stream
-            }
+            Frame::Open { stream, .. }
+            | Frame::Data { stream, .. }
+            | Frame::RespHead { stream, .. }
+            | Frame::End { stream, .. } => *stream,
             _ => 0,
         }
     }
@@ -120,6 +135,7 @@ impl Frame {
             }
             Frame::Open { stream, head } => (head, *stream),
             Frame::Data { stream, bytes } => (bytes, *stream),
+            Frame::RespHead { stream, head } => (head, *stream),
             // No payload: the stream id already rides in the header, so HalfEnd is
             // the generic 7-byte frame with an empty body.
             Frame::HalfEnd { stream } => (&[][..], *stream),
@@ -169,6 +185,10 @@ impl Frame {
             T_DATA => Frame::Data {
                 stream,
                 bytes: payload.to_vec(),
+            },
+            T_RESP_HEAD => Frame::RespHead {
+                stream,
+                head: payload.to_vec(),
             },
             T_HALF_END => {
                 if !payload.is_empty() {
