@@ -6,7 +6,7 @@
 //! here, the truncation is hyper's framing/flushing, not anvil-ring's logic.
 
 use bytes::Bytes;
-use futures_util::stream::{self, StreamExt};
+use futures_util::stream;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
 use hyper::server::conn::http1;

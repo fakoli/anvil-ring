@@ -1,6 +1,6 @@
 //! HTTP/1.1 chunked-transfer decoding, for the tether's engine reads.
 //!
-//! WHY THIS EXISTS
+//! Why this decoder exists
 //! `transfer-encoding` is a hop-by-hop header (RFC 9110 §7.6.1) and this crate
 //! strips it from forwarded messages — correctly, and `headers::ALWAYS_STRIP` is
 //! the single place that says so. But the ENGINE's *body bytes* are chunked. So a
@@ -16,9 +16,9 @@
 //! framing). That is what "hop-by-hop" means, and it is why the header is stripped
 //! rather than forwarded.
 //!
-//! INVARIANTS
+//! Required behavior
 //! - Streaming is preserved: a chunk that is complete is emitted immediately, even
-//!   if the rest of the stream has not arrived (I-9). A decoder that buffered to
+//!   if the rest of the stream has not arrived. A decoder that buffered to
 //!   find the next boundary would silently break token streaming.
 //! - A partial chunk is *not* emitted early. Emitting `data: t` from a `data: two`
 //!   chunk would be correct on the wire but wrong for a client parsing SSE events.
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn emits_a_complete_chunk_immediately_without_waiting() {
-        // The I-9 property, stated as a unit test: one SSE event arriving must be
+        // One server-sent event must be
         // forwardable before any later event exists. If this regressed, every token
         // would wait for the whole completion and the tunnel would look like vLLM
         // was 10x slower.
@@ -236,7 +236,7 @@ mod tests {
         // What this invariant actually is, corrected after a wrong assertion:
         //
         // A chunk's bytes may legitimately arrive in pieces, and forwarding the
-        // pieces as they arrive is the POINT (I-9) -- SSE payloads are byte streams,
+        // pieces as they arrive preserves streaming—SSE payloads are byte streams,
         // and an event ending mid-read is the engine's own flush boundary, not ours.
         // Buffering until a chunk is "complete" would add latency per token and, for
         // an engine that flushes one partial line, could stall forever.

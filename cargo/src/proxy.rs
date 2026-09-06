@@ -1,5 +1,5 @@
-//! The reverse proxy: forwards to the loopback inference engine, streaming with
-//! immediate flush (I-9) and enforcing the bearer check (I-10).
+//! The reverse proxy forwards to a loopback inference engine, flushes streaming
+//! chunks as they arrive, and authenticates callers with a bearer token.
 
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
@@ -19,7 +19,7 @@ pub struct Proxy {
 }
 
 /// A dead engine must surface as 502 quickly rather than hang, because a hung
-/// endpoint is indistinguishable from a slow generation (I-6).
+/// endpoint is indistinguishable from a slow model generation.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Proxy {
@@ -47,15 +47,15 @@ impl Proxy {
     }
 
     async fn handle(&self, req: Request<Incoming>) -> Response<ResBody> {
-        // I-10: authenticate once, here, before the engine is touched at all.
+        // Authenticate before opening any connection to the serving engine.
         if let Some(expected) = &self.token {
             if !authorized(req.headers(), expected) {
                 return text(StatusCode::UNAUTHORIZED, "unauthorized\n");
             }
         }
 
-        // Runtime guard on I-10: a typo in ANVIL_RING_UPSTREAM must not silently
-        // turn this into an open proxy to an arbitrary host.
+        // A typo in ANVIL_RING_UPSTREAM must not turn this into an open proxy to
+        // an arbitrary host.
         if !is_loopback(&self.upstream) {
             return text(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -126,7 +126,7 @@ fn rebuild_request(
     b.body(body).map_err(|e| e.to_string())
 }
 
-/// Copy the upstream response through **without buffering the body** (I-9).
+/// Copy the upstream response through **without buffering the body**.
 ///
 /// `Incoming` is itself a stream: taking `into_body()` and forwarding it
 /// unchanged makes hyper write each chunk as it arrives, which is exactly the
@@ -179,7 +179,7 @@ fn forward_uri(upstream: &hyper::Uri, req_uri: &hyper::Uri) -> Option<hyper::Uri
     format!("{scheme}://{authority}{path}{qs}").parse().ok()
 }
 
-/// The single definition of "loopback" for the whole crate (I-10).
+/// The single definition of "loopback" for the complete crate.
 ///
 /// Takes an `SocketAddr`, NOT a string, on purpose: callers previously string-split
 /// authority into host themselves, and one of them passed `host:port` here, so a
@@ -201,68 +201,71 @@ pub fn is_loopback_addr(addr: &std::net::SocketAddr) -> bool {
 /// `default_port` is used only when the authority omits one.
 ///
 /// Deliberately *no* DNS: a hostname is refused rather than resolved. A name that
-/// resolves off-host (or is later re-pointed) would turn "loopback only" into a
-/// routable connection, and resolving it here would make that invisible. Callers
-/// that genuinely want `localhost` pass it as a literal, which resolves via the
-/// OS to 127.0.0.1/::1 through the same `to_socket_addrs` path as everything else.
+/// resolves off-host (or is later re-pointed) would expand the trust boundary.
+/// The exact name `localhost` is mapped directly to a
+/// literal loopback address without consulting DNS.
 pub fn loopback_authority(
     authority: &str,
     default_port: u16,
 ) -> std::io::Result<std::net::SocketAddr> {
-    use std::net::ToSocketAddrs;
-    // Trim any scheme prefix so callers cannot smuggle one in here, and reject
-    // anything path-shaped -- an authority must not contain '/'.
-    let authority = authority.split("://").nth(1).unwrap_or(authority);
-    let authority = authority.split('/').next().unwrap_or(authority);
-    if authority.trim().is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "empty upstream authority",
-        ));
-    }
-    // `:port` already present -> parse as-is; otherwise append the default.
-    let candidate = if authority.rsplit_once(']').is_some() || authority.matches(':').count() > 1 {
-        // bracketed IPv6 or bare IPv6: no port given
-        format!(
-            "[{}]:{default_port}",
-            authority.trim_matches(|c| c == '[' || c == ']')
+    use std::io::{Error, ErrorKind};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    let invalid = || {
+        Error::new(
+            ErrorKind::InvalidInput,
+            "invalid loopback upstream authority",
         )
-    } else if authority.contains(':') {
-        authority.to_string()
-    } else {
-        format!("{authority}:{default_port}")
     };
-    let addr = candidate
-        .to_socket_addrs()
-        .map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("bad upstream authority {authority}: {e}"),
-            )
-        })?
-        .next()
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("no address for {authority}"),
-            )
-        })?;
-    if !is_loopback_addr(&addr) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("refusing non-loopback upstream {addr} (I-10)"),
+    let uri = if authority.contains("://") {
+        let uri: http::Uri = authority.parse().map_err(|_| invalid())?;
+        if uri.scheme_str() != Some("http") || uri.query().is_some() || authority.contains('#') {
+            return Err(invalid());
+        }
+        Some(uri)
+    } else {
+        None
+    };
+    let authority = match &uri {
+        Some(uri) => uri.authority().ok_or_else(invalid)?.as_str(),
+        None => authority,
+    };
+    if authority.contains('@') {
+        return Err(invalid());
+    }
+    let addr = if let Ok(addr) = authority.parse::<SocketAddr>() {
+        addr
+    } else if let Ok(ip) = authority.trim_matches(['[', ']']).parse::<IpAddr>() {
+        SocketAddr::new(ip, default_port)
+    } else {
+        let authority: http::uri::Authority = authority.parse().map_err(|_| invalid())?;
+        let host = authority.host().trim_matches(['[', ']']);
+        let ip = if host.eq_ignore_ascii_case("localhost") {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        } else {
+            host.parse::<IpAddr>().map_err(|_| invalid())?
+        };
+        let port = match authority.port() {
+            Some(port) => port.as_str().parse::<u16>().map_err(|_| invalid())?,
+            None => default_port,
+        };
+        SocketAddr::new(ip, port)
+    };
+    if !addr.ip().is_loopback() {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "serving upstream must use loopback",
         ));
     }
     Ok(addr)
 }
 
 fn is_loopback(uri: &hyper::Uri) -> bool {
-    uri.host()
-        .is_some_and(|h| matches!(loopback_authority(h, 0), Ok(_)))
+    loopback_authority(&uri.to_string(), 80).is_ok()
 }
 
 async fn connect_loopback(host: &str) -> std::io::Result<TcpStream> {
-    match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(host)).await {
+    let address = loopback_authority(host, 80)?;
+    match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address)).await {
         Ok(r) => r,
         Err(_) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -295,6 +298,42 @@ fn text(status: StatusCode, body: &str) -> Response<ResBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connection_rejects_wildcard_instead_of_dialing_it() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let result = connect_loopback(&format!(
+            "0.0.0.0:{}",
+            listener.local_addr().unwrap().port()
+        ))
+        .await;
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn localhost_connects_to_the_validated_literal_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = connect_loopback(&format!("localhost:{}", addr.port()))
+            .await
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), addr);
+        assert_eq!(
+            loopback_authority("localhost", 80).unwrap(),
+            "127.0.0.1:80".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn ipv6_loopback_authority_preserves_an_explicit_port() {
+        assert_eq!(
+            loopback_authority("http://[::1]:8000", 80).unwrap(),
+            "[::1]:8000".parse().unwrap()
+        );
+    }
 
     #[test]
     fn forward_uri_preserves_path_and_query() {

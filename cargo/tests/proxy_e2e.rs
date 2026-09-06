@@ -1,17 +1,17 @@
 //! End-to-end tests: spawn the REAL `anvil-ring` binary against a fake engine.
 //!
 //! Going through the actual executable is deliberate -- it also verifies the
-//! naming directive (the binary is `anvil-ring`) and the config-by-environment
-//! rule (I-8), neither of which a unit test can observe.
+//! naming directive (the binary is `anvil-ring`) and the requirement that
+//! credentials come from the environment, neither of which a unit test observes.
 //!
 //! The important test is `streaming_arrives_incrementally_not_all_at_once`:
-//! invariant I-9 says a buffering bug shows up as latency and never as an error,
-//! so asserting on *eventual* body equality would pass on a broken, buffering
-//! proxy. That test asserts on arrival TIMING.
+//! a buffering bug appears as latency rather than an error, so asserting only on
+//! eventual body equality would pass on a broken proxy. This test also checks
+//! arrival timing.
 //!
 //! HARNESS NOTES (each learned from an actual failure here):
-//!  1. Ports are RESERVED, not reused: sharing one port pair across tests made
-//!     results depend on execution order.
+//!  1. The operating system assigns loopback ports for each test. Fixed ports made
+//!     results depend on unrelated local processes.
 //!  2. Never trust `wait_for_port` alone -- it passes if ANY process holds the
 //!     port, including a leftover proxy from a previous run. `Harness::new`
 //!     asserts our own child bound it, by checking the proxy's log line.
@@ -25,24 +25,20 @@ use std::time::{Duration, Instant};
 
 const TOKEN: &str = "test-token-abcdef";
 
-/// Disjoint port pairs per test (engine = base, proxy = base + 1).
-const PORTS: &[(&str, u16)] = &[
-    ("unauthenticated_request_is_rejected", 18420),
-    ("wrong_token_is_rejected", 18430),
-    ("authenticated_request_is_proxied", 18440),
-    ("streaming_arrives_incrementally_not_all_at_once", 18450),
-    ("missing_token_refuses_to_start", 18460),
-];
-
 fn ring_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_anvil-ring"))
 }
 
+fn buffering_canary_bin() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_anvil-ring-buffering-canary"))
+}
+
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve loopback port");
+    listener.local_addr().expect("read loopback port").port()
+}
+
 struct Harness {
-    /// Retained for diagnostics; the proxy is configured with it, so the field is
-    /// intentionally kept even though no assertion reads it yet.
-    #[allow(dead_code)]
-    engine_port: u16,
     proxy_port: u16,
     log_path: std::path::PathBuf,
     proxy: Option<Child>,
@@ -61,21 +57,33 @@ impl Drop for Harness {
 }
 
 impl Harness {
-    fn new(test_name: &str, chunks: Vec<&'static str>, gap: Duration, token: Option<&str>) -> Self {
-        let (engine_port, proxy_port) = PORTS
-            .iter()
-            .find(|(n, _)| *n == test_name)
-            .map(|(_, b)| (*b, *b + 1))
-            .unwrap_or_else(|| panic!("no port reservation for {test_name}; add one to PORTS"));
+    fn new(chunks: Vec<&'static str>, gap: Duration, token: Option<&str>) -> Self {
+        Self::with_command(ring_bin(), &["proxy"], chunks, gap, token)
+    }
 
-        let log_path = std::env::temp_dir().join(format!("anvil-ring-e2e-{proxy_port}.log"));
+    fn buffering_canary(chunks: Vec<&'static str>, gap: Duration, token: Option<&str>) -> Self {
+        Self::with_command(buffering_canary_bin(), &[], chunks, gap, token)
+    }
+
+    fn with_command(
+        binary: std::path::PathBuf,
+        args: &[&str],
+        chunks: Vec<&'static str>,
+        gap: Duration,
+        token: Option<&str>,
+    ) -> Self {
+        let engine_port = spawn_fake_engine(chunks, gap);
+        let proxy_port = free_port();
+
+        let log_path = std::env::temp_dir().join(format!(
+            "anvil-ring-e2e-{}-{proxy_port}.log",
+            std::process::id()
+        ));
         // Truncate any stale log so we cannot read a previous run's AddrInUse.
         let log_file = std::fs::File::create(&log_path).expect("create proxy log");
 
-        let _engine = spawn_fake_engine(engine_port, chunks, gap);
-
-        let mut cmd = Command::new(ring_bin());
-        cmd.arg("proxy")
+        let mut cmd = Command::new(binary);
+        cmd.args(args)
             .env("ANVIL_RING_LISTEN", format!("127.0.0.1:{proxy_port}"))
             .env(
                 "ANVIL_RING_UPSTREAM",
@@ -96,7 +104,6 @@ impl Harness {
         let proxy = cmd.spawn().expect("spawn anvil-ring");
 
         let mut h = Self {
-            engine_port,
             proxy_port,
             log_path,
             proxy: Some(proxy),
@@ -155,15 +162,20 @@ impl Harness {
     }
 }
 
-fn spawn_fake_engine(
-    engine_port: u16,
-    chunks: Vec<&'static str>,
-    gap: Duration,
-) -> std::thread::JoinHandle<()> {
+fn arrived_incrementally(chunks: &[TcpChunk], minimum_spread: Duration) -> bool {
+    chunks.len() >= 2
+        && chunks
+            .last()
+            .expect("non-empty chunks")
+            .at
+            .saturating_sub(chunks[0].at)
+            >= minimum_spread
+}
+
+fn spawn_fake_engine(chunks: Vec<&'static str>, gap: Duration) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake engine");
+    let engine_port = listener.local_addr().expect("read engine port").port();
     std::thread::spawn(move || {
-        let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", engine_port)) else {
-            return;
-        };
         for stream in listener.incoming().take(16) {
             let Ok(socket) = stream else { continue };
             let chunks = chunks.clone();
@@ -171,7 +183,8 @@ fn spawn_fake_engine(
                 let _ = serve_fake_engine(socket, &chunks, gap);
             });
         }
-    })
+    });
+    engine_port
 }
 
 /// Read one request (headers AND body), then respond with chunked SSE.
@@ -241,13 +254,32 @@ fn request(proxy_port: u16, raw: String) -> Vec<TcpChunk> {
                     at: start.elapsed(),
                     bytes: buf[..n].to_vec(),
                 });
-                if start.elapsed() > Duration::from_secs(6) {
+                let response: Vec<u8> =
+                    out.iter().flat_map(|chunk| &chunk.bytes).copied().collect();
+                if response_is_complete(&response) {
                     break;
                 }
             }
         }
     }
     out
+}
+
+fn response_is_complete(response: &[u8]) -> bool {
+    let Some(head_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let body_start = head_end + 4;
+    let head = String::from_utf8_lossy(&response[..head_end]).to_ascii_lowercase();
+    if head.contains("transfer-encoding: chunked") {
+        return response[body_start..]
+            .windows(5)
+            .any(|window| window == b"0\r\n\r\n");
+    }
+    head.lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .is_some_and(|length| response.len() >= body_start + length)
 }
 
 fn joined(chunks: &[TcpChunk]) -> String {
@@ -307,14 +339,9 @@ fn post(port: u16, auth: Option<&str>, close: bool) -> Vec<TcpChunk> {
 
 #[test]
 fn missing_token_refuses_to_start() {
-    // I-10: an unauthenticated proxy between the network and the inference port
-    // must be fatal at startup, not a warning.
-    let mut h = Harness::new(
-        "missing_token_refuses_to_start",
-        vec![],
-        Duration::ZERO,
-        None,
-    );
+    // An unauthenticated proxy between the network and the inference port must
+    // fail at startup, not continue after a warning.
+    let mut h = Harness::new(vec![], Duration::ZERO, None);
     let mut child = h.take_proxy().expect("proxy handle");
     let status = child.wait().expect("wait");
     assert!(!status.success(), "must exit non-zero without a token");
@@ -328,13 +355,36 @@ fn missing_token_refuses_to_start() {
 }
 
 #[test]
-fn unauthenticated_request_is_rejected() {
-    let h = Harness::new(
-        "unauthenticated_request_is_rejected",
-        vec!["data: x\n\n"],
-        Duration::from_millis(5),
-        Some(TOKEN),
+fn zero_does_not_disable_authentication() {
+    let engine_port = free_port();
+    let listen = format!("127.0.0.1:{}", free_port());
+    let output = Command::new(ring_bin())
+        .arg("proxy")
+        .env("ANVIL_RING_LISTEN", &listen)
+        .env(
+            "ANVIL_RING_UPSTREAM",
+            format!("http://127.0.0.1:{engine_port}"),
+        )
+        .env("ANVIL_RING_ALLOW_NO_AUTH", "0")
+        .env_remove("ANVIL_RING_TOKEN")
+        .output()
+        .expect("run proxy");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("refusing to start"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        TcpStream::connect(&listen).is_err(),
+        "ANVIL_RING_ALLOW_NO_AUTH=0 must not bind an unauthenticated listener"
+    );
+}
+
+#[test]
+fn unauthenticated_request_is_rejected() {
+    let h = Harness::new(vec!["data: x\n\n"], Duration::from_millis(5), Some(TOKEN));
     let res = post(h.proxy_port(), None, true);
     let all = joined(&res);
     assert!(
@@ -346,12 +396,7 @@ fn unauthenticated_request_is_rejected() {
 
 #[test]
 fn wrong_token_is_rejected() {
-    let h = Harness::new(
-        "wrong_token_is_rejected",
-        vec!["data: x\n\n"],
-        Duration::from_millis(5),
-        Some(TOKEN),
-    );
+    let h = Harness::new(vec!["data: x\n\n"], Duration::from_millis(5), Some(TOKEN));
     let res = post(h.proxy_port(), Some("definitely-not-the-token"), true);
     let all = joined(&res);
     assert!(
@@ -364,7 +409,6 @@ fn wrong_token_is_rejected() {
 #[test]
 fn authenticated_request_is_proxied() {
     let h = Harness::new(
-        "authenticated_request_is_proxied",
         vec!["data: hello\n\n"],
         Duration::from_millis(5),
         Some(TOKEN),
@@ -394,7 +438,8 @@ fn authenticated_request_is_proxied() {
     );
 }
 
-/// I-9 REGRESSION GUARD. A buffering proxy passes every other test in this file.
+/// A buffering proxy passes every other test in this file, so this test measures
+/// when each event arrives as well as checking the final body.
 #[test]
 fn streaming_arrives_incrementally_not_all_at_once() {
     let chunks = vec![
@@ -404,12 +449,7 @@ fn streaming_arrives_incrementally_not_all_at_once() {
         "data: [DONE]\n\n",
     ];
     let gap = Duration::from_millis(300);
-    let h = Harness::new(
-        "streaming_arrives_incrementally_not_all_at_once",
-        chunks.clone(),
-        gap,
-        Some(TOKEN),
-    );
+    let h = Harness::new(chunks.clone(), gap, Some(TOKEN));
     // No `connection: close`: keep the stream open so reads arrive incrementally.
     let res = post(h.proxy_port(), Some(TOKEN), false);
 
@@ -427,13 +467,34 @@ fn streaming_arrives_incrementally_not_all_at_once() {
     // yields several reads spread over that window; a buffering proxy delivers a
     // single burst at the end.
     assert!(
-        res.len() >= 2,
-        "expected multiple TCP reads (streaming), got {} -- proxy is buffering (I-9)",
-        res.len()
+        arrived_incrementally(&res, Duration::from_millis(200)),
+        "expected multiple reads spread over at least 200ms; got {} reads over {:?}",
+        res.len(),
+        res.last()
+            .map(|last| last.at.saturating_sub(res[0].at))
+            .unwrap_or_default()
     );
-    let spread = res.last().unwrap().at.saturating_sub(res[0].at);
+}
+
+#[test]
+fn streaming_assertion_rejects_the_buffering_canary() {
+    let chunks = vec![
+        "data: one\n\n",
+        "data: two\n\n",
+        "data: three\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let h = Harness::buffering_canary(chunks.clone(), Duration::from_millis(300), Some(TOKEN));
+    let response = post(h.proxy_port(), Some(TOKEN), false);
+    let body = body_of(&response);
     assert!(
-        spread >= Duration::from_millis(200),
-        "arrival spread {spread:?} too tight -- output was buffered (I-9 violation)"
+        chunks
+            .iter()
+            .all(|chunk| body.contains(chunk.trim_start_matches("data: ").trim())),
+        "canary must return a complete body so buffering is the only defect: {body:?}"
+    );
+    assert!(
+        !arrived_incrementally(&response, Duration::from_millis(200)),
+        "the timing assertion did not reject the deliberately buffered response"
     );
 }

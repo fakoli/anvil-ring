@@ -1,9 +1,9 @@
 //! Wire frames for the outbound tunnel.
 //!
 //! Hand-rolled and tiny on purpose: a frame is parsed once per proxied chunk, so
-//! its cost is multiplied by token rate (I-9's concern), and a permissive length
+//! its cost is multiplied by the streaming chunk rate, and a permissive length
 //! field on a connection we treat as untrusted-by-default is where parser bugs
-//! live. Hence: fixed 5-byte header, u32 length, an explicit hard cap, and
+//! live. Hence: fixed 7-byte header, u32 length, an explicit hard cap, and
 //! rejection of anything unrecognized rather than best-effort tolerance.
 //!
 //! Frame layout (network byte order):
@@ -18,19 +18,19 @@
 //!                   registration credential in the payload. Never re-sent.
 //!   0x02 WELCOME    hub -> client, once, after it has authorized HELLO. Payload
 //!                   is the lease lifetime in seconds as decimal ASCII: the client
-//!                   MUST reconnect and re-authorize within it (I-3).
-//!   0x03 OPEN       hub -> client: open stream <id>, payload is the request head
+//!                   MUST reconnect and reauthorize within it.
+//!   0x03 OPEN       hub -> client: open the identified stream; payload is the request head
 //!                   (origin-form request line + headers, CRLF terminated).
 //!   0x04 DATA       either direction: a chunk on an open stream.
 //!   0x05 END        either direction: end-of-stream. Payload may carry a one-line
 //!                   error reason; empty means clean completion.
 //!   0x06 PING       either direction.  0x07 PONG is the reply.
 //!   0x08 GOAWAY     hub -> client: stop dialing, this lease is ending. Lets a
-//!                   revoked credential end an idle tunnel promptly (I-3).
+//!                   revoked credential end an idle tunnel promptly.
 //!
 //! There is deliberately NO frame type for "serve this port" or "this is my
-//! permission": I-5 puts those decisions on the hub, so a client that could
-//! self-describe its own permissions would be a hole in the threat model.
+//! permission." The hub owns those decisions; allowing a client to describe its
+//! own permissions would bypass the authorization boundary.
 
 use std::fmt;
 
@@ -47,16 +47,12 @@ pub const T_END: u8 = 0x05;
 pub const T_PING: u8 = 0x06;
 pub const T_PONG: u8 = 0x07;
 pub const T_GOAWAY: u8 = 0x08;
-/// Request body is complete; the peer must half-close toward the engine and keep
+/// Request body is complete; the peer ends the engine HTTP request body and keeps
 /// streaming the answer. Distinct from END ("I am gone"), because aborting a
 /// request and finishing one both happen, and conflating them truncates the answer.
 pub const T_HALF_END: u8 = 0x09;
-/// An engine's response head, carried separately from the body. The tether cannot
-/// know whether a body is chunk-coded until it has SEEN the body, and it must not
-/// forward a `transfer-encoding` header for framing it is about to remove -- so
-/// the head is withheld until the decision is made. Without this frame type the
-/// only options were "send a possibly-lying head early" or "send the head as a
-/// body chunk", and the second one puts the raw status line in the caller's body.
+/// The final engine response head, separate from body DATA. Hop-by-hop framing
+/// has already been removed; the caller-facing HTTP hop regenerates it.
 pub const T_RESP_HEAD: u8 = 0x0A;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,8 +292,8 @@ mod tests {
 
     #[test]
     fn welcome_lease_survives_large_and_zero_values() {
-        // A lease of 0 must not be silently coerced to "no limit" -- that would
-        // turn I-3 inside out.
+        // A lifetime of 0 must not be silently coerced to "no limit," which
+        // would disable the authorization bound.
         roundtrip(Frame::Welcome { lease_secs: 0 });
         roundtrip(Frame::Welcome {
             lease_secs: u64::MAX / 2,

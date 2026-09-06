@@ -1,9 +1,8 @@
 //! Streaming body for the caller-facing frontend: engine bytes, in order, flushed.
 //!
-//! This type is why I-9 survives the extra hop. If the frontend collected the whole
-//! engine answer before replying, every property the proxy's flush test proved would
-//! be undone one hop later -- and undone *undetected*, since the bytes would still
-//! arrive correct. A timing assertion at this layer is what keeps that honest.
+//! If the frontend collected the complete engine answer before replying, it would
+//! undo the proxy's incremental delivery while preserving the final bytes. A
+//! timing assertion at this layer detects that failure.
 //!
 //! Design note, because the alternative was tried and rejected: the receiver is
 //! stored as `Mutex<Option<Receiver>>` and *taken* for the duration of one poll.
@@ -35,6 +34,7 @@ pub enum TunnelBody {
     Live(
         Arc<Mutex<Option<mpsc::Receiver<ChunkOrEnd>>>>,
         Arc<dyn Send + Sync>,
+        Arc<crate::hub::StreamFailure>,
     ),
     Fixed(Bytes),
 }
@@ -45,7 +45,8 @@ impl TunnelBody {
     /// The `Forwarded` is required, not incidental: it is what keeps the hub's
     /// stream registration and channel sender alive until the body is drained.
     pub fn live(rx: mpsc::Receiver<ChunkOrEnd>, stream: Arc<crate::hub::Forwarded>) -> Self {
-        TunnelBody::Live(Arc::new(Mutex::new(Some(rx))), stream)
+        let failure = stream.failure();
+        TunnelBody::Live(Arc::new(Mutex::new(Some(rx))), stream, failure)
     }
 
     /// Body over a bare channel, for tests that exercise the CHANNEL/BODY contract
@@ -58,7 +59,11 @@ impl TunnelBody {
     /// complete. Nothing built here keeps a stream registered, so nothing should
     /// mistake this for the real path.
     pub fn live_for_test(rx: mpsc::Receiver<ChunkOrEnd>) -> Self {
-        TunnelBody::Live(Arc::new(Mutex::new(Some(rx))), Arc::new(()))
+        TunnelBody::Live(
+            Arc::new(Mutex::new(Some(rx))),
+            Arc::new(()),
+            Arc::new(crate::hub::StreamFailure::default()),
+        )
     }
 
     /// Convenience: consume the forwarded stream into its own body, so the
@@ -94,7 +99,7 @@ impl Stream for TunnelBody {
                     Poll::Ready(Some(Ok(std::mem::take(buf))))
                 }
             }
-            TunnelBody::Live(slot, _stream) => {
+            TunnelBody::Live(slot, _stream, failure) => {
                 // Take the receiver out for this poll. The mutex is held only for
                 // this statement -- never across the `poll_next` below -- so a
                 // competing poll waits on the lock rather than on our work.
@@ -112,11 +117,23 @@ impl Stream for TunnelBody {
 
                 // poll_recv is the receiver's own poll. It returns Ready(None)
                 // only once the channel is closed AND drained, which is a real end.
+                if failure.poll_failed(cx) {
+                    return Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "upstream response interrupted",
+                    ))));
+                }
+                // Closing after acquiring completion preserves all preceding
+                // DATA and lets the channel report EOF only after draining.
+                // poll_recv can return Pending for cooperative scheduling even
+                // with queued data, so Pending must never mean "empty" here.
+                if failure.is_complete() {
+                    taken.close();
+                }
                 let out = Pin::new(&mut taken).poll_recv(cx);
 
                 match out {
                     Poll::Ready(Some(ChunkOrEnd::Chunk(b))) => {
-                        eprintln!("BODY poll_next -> Chunk {}B (total {}B)", b.len(), 0);
                         if let Ok(mut guard) = slot.lock() {
                             *guard = Some(taken);
                         }
@@ -125,10 +142,7 @@ impl Stream for TunnelBody {
                     // END or a closed channel means no more bytes. The receiver is
                     // deliberately NOT restored: leaving it gone makes any later
                     // poll end cleanly via the `None` arm above.
-                    Poll::Ready(Some(ChunkOrEnd::End)) | Poll::Ready(None) => {
-                        eprintln!("BODY poll_next -> END (terminates the caller's body)");
-                        Poll::Ready(None)
-                    }
+                    Poll::Ready(Some(ChunkOrEnd::End)) | Poll::Ready(None) => Poll::Ready(None),
                     Poll::Pending => {
                         if let Ok(mut guard) = slot.lock() {
                             *guard = Some(taken);
@@ -145,7 +159,7 @@ impl Stream for TunnelBody {
 ///
 /// `caller_token` authenticates callers. In the fleet this is the router's own
 /// credential: a caller may not name a tether, present a registration credential,
-/// or otherwise influence routing (I-5).
+/// or otherwise influence routing.
 pub async fn serve_frontend(
     listen: SocketAddr,
     registry: Arc<Registry>,
@@ -175,26 +189,13 @@ pub async fn serve_frontend(
                     .with_upgrades()
                     .await
                 {
-                    // Surfaced, not swallowed (I-6).
+                    // Report connection failures instead of hiding them.
                     eprintln!("anvil-ring frontend: connection error: {e}");
                 }
             });
         }
     });
     Ok(())
-}
-
-/// Pick which tether serves a request.
-///
-/// Deliberately not parameterized by anything the caller sends (I-5). One up
-/// tether is picked today; a fleet with several needs a policy here, and that
-/// policy must live on the hub regardless of what a caller asks for.
-fn pick_tether(registry: &Registry) -> Option<String> {
-    registry
-        .status()
-        .into_iter()
-        .find(|(_, _, s)| matches!(s, crate::hub::TetherState::Up(_)))
-        .map(|(id, _, _)| id)
 }
 
 async fn handle(
@@ -227,16 +228,11 @@ async fn handle(
         return Ok(error_response(StatusCode::UNAUTHORIZED));
     }
 
-    let Some(tether_id) = pick_tether(&registry) else {
-        // Distinct from 401 on purpose -- see the module comment in hub.rs.
-        return Ok(error_response(StatusCode::BAD_GATEWAY));
-    };
-
-    match registry.forward(&tether_id, req).await {
+    match registry.forward_any(req) {
         Ok(forwarded) => {
             // The engine's own status and headers must reach the caller. An engine
             // 500 republished as a hub 200 would poison every caller's retry logic
-            // (I-11: never invent an upstream answer).
+            // by inventing a successful hub response.
             let head = forwarded.head().await;
             // No head means no upstream answer, and that is a FAILURE, reported as
             // one. This line was `unwrap_or(StatusCode::OK)`, which fabricated a
@@ -250,12 +246,12 @@ async fn handle(
             // instead of republishing it as a hub 200, which would poison caller
             // retry logic. The cost is one round trip before response headers; it is
             // paid once per request, not per token, and it does NOT buffer the body
-            // (I-9 holds -- the body still streams from `rx` unbuffered).
+            // because the body still streams from `rx` without buffering.
             let Some(head) = head else {
                 return Ok(error_response(caller_status_for(None)));
             };
-            let mut builder = Response::builder()
-                .status(caller_status_for(Some(head.status().as_u16())));
+            let mut builder =
+                Response::builder().status(caller_status_for(Some(head.status().as_u16())));
             for (name, value) in head.headers() {
                 // Hop-by-hop must not cross this hop; copying blindly would
                 // reintroduce e.g. transfer-encoding, which we strip and re-frame.
@@ -265,7 +261,7 @@ async fn handle(
             }
             // An http::Error here means a header from the engine that hyper
             // rejects: an upstream protocol fault. Answer 500, never a fabricated
-            // 200 (I-11). hyper::Error has no public constructor, so the service
+            // 200. hyper::Error has no public constructor, so the service
             // returns a Response rather than an Err.
             Ok(builder
                 .body(TunnelBody::from_forwarded(forwarded))
@@ -280,6 +276,7 @@ async fn handle(
                 // upstream. Which is which belongs in the hub log, not the body.
                 error_response(StatusCode::SERVICE_UNAVAILABLE)
             }
+            crate::hub::ForwardError::TetherBusy => error_response(StatusCode::SERVICE_UNAVAILABLE),
             crate::hub::ForwardError::Idhausted => error_response(StatusCode::TOO_MANY_REQUESTS),
             crate::hub::ForwardError::CallerBody => error_response(StatusCode::BAD_REQUEST),
         }),
@@ -308,7 +305,7 @@ fn error_response(status: hyper::StatusCode) -> hyper::Response<TunnelBody> {
 pub fn caller_status_for(head_status: Option<u16>) -> StatusCode {
     match head_status {
         // The engine's own status is republished verbatim, including 4xx/5xx, so
-        // caller retry logic sees the truth (I-11).
+        // caller retry logic sees the actual upstream result.
         //
         // `from_u16` accepts 100..=999, so within this function's input type
         // (a u16 that already PARSED as a number -- see `parse_head`, which does

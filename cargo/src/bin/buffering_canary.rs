@@ -1,10 +1,11 @@
-//! NEGATIVE CONTROL for invariant I-9. This binary deliberately BUFFERSS the
-//! entire upstream response before replying.
+//! Negative control for incremental streaming. This binary deliberately buffers
+//! the entire upstream response before replying.
 //!
-//! It exists so the streaming regression test can be shown to have teeth: if the
+//! It exists so the streaming regression test can prove that it detects a real
+//! timing defect. If the
 //! real proxy ever started buffering and the test could not tell the difference,
-//! the test would be decorative. `tests/negative_control.rs` runs the streaming
-//! assertion against this binary and REQUIRES it to fail.
+//! the test would be ineffective. `proxy_e2e` runs the same timing predicate
+//! against this binary and the real proxy.
 //!
 //! DO NOT "FIX" THIS FILE. A correct implementation here defeats its purpose.
 
@@ -79,12 +80,15 @@ fn handle(
         .find_map(|l| l.strip_prefix("content-length:"))
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(0);
-    let mut sink = [0u8; 1024];
+    let mut body = Vec::with_capacity(remaining);
+    let mut chunk = [0u8; 1024];
     while remaining > 0 {
-        let n = client.read(&mut sink)?;
+        let limit = remaining.min(chunk.len());
+        let n = client.read(&mut chunk[..limit])?;
         if n == 0 {
             break;
         }
+        body.extend_from_slice(&chunk[..n]);
         remaining = remaining.saturating_sub(n);
     }
 
@@ -92,7 +96,8 @@ fn handle(
     up.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
     // Rewrite the Host header so the plain forward reaches the engine; keep the
     // request-line in origin-form (hyper rejects absolute-form).
-    let rewritten = rewrite_host(&req, &upstream_host)?;
+    let mut rewritten = rewrite_host(&req, &upstream_host)?;
+    rewritten.extend_from_slice(&body);
     up.write_all(&rewritten)?;
     up.flush()?;
 

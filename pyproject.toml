@@ -3,14 +3,19 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "anvil-ring"
+name = "anvil-ring-tools"
 version = "0.1.0"
-description = "Outbound-initiated tether that exposes a rented GPU host's model-serving port to the Anvil family (stdlib-only)."
+description = "Deployment diagnostics for the Anvil Ring outbound-only model-serving tunnel."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [{ name = "fakoli" }]
 dependencies = []   # stdlib-only by design (mirrors anvil-events)
+
+[project.urls]
+Documentation = "https://fakoli.github.io/anvil-ring/"
+Repository = "https://github.com/fakoli/anvil-ring"
+Issues = "https://github.com/fakoli/anvil-ring/issues"
 
 [project.optional-dependencies]
 dev = ["pytest", "coverage>=7.6", "jsonschema[format]>=4.23", "ruff==0.11.12"]
@@ -27,14 +32,10 @@ ignore = []
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["B"]
 
-# NAMING RULE (operator directive): the executable is `anvil-ring` and is ALWAYS
-# invoked with the anvil- prefix. There is deliberately no bare `ring` entry
-# point and no short alias -- the prefix is the namespace. Do not add one.
+# The working tunnel runtime is the Rust `anvil-ring` binary in cargo/.  Python
+# only ships the stdlib egress diagnostic, under an unambiguous executable name.
 [project.scripts]
-anvil-ring = "anvil_ring.cli:main"
+anvil-ring-probe-egress = "anvil_ring.probe_egress:main"
 
 [tool.setuptools.packages.find]
 include = ["anvil_ring*"]
-
-[tool.setuptools.data-files]
-"share/anvil-ring/schemas" = ["schemas/tether-v1.json"]

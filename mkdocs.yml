@@ -1,0 +1,83 @@
+site_name: Anvil Ring
+site_description: >-
+  Operate and verify an outbound-only authenticated HTTP tunnel for model-serving workloads.
+site_url: https://fakoli.github.io/anvil-ring/
+repo_url: https://github.com/fakoli/anvil-ring
+repo_name: fakoli/anvil-ring
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+
+# Internal implementation plans are kept in the repository but are not part of
+# the public documentation site.
+exclude_docs: |
+  superpowers/
+
+theme:
+  name: material
+  palette:
+    - media: '(prefers-color-scheme: light)'
+      scheme: default
+      primary: black
+      accent: deep orange
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: '(prefers-color-scheme: dark)'
+      scheme: slate
+      primary: black
+      accent: deep orange
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - toc.follow
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Get started:
+      - Concepts and terminology: concepts.md
+      - Operator guide: operator-guide.md
+      - CLI reference: cli-reference.md
+      - Production rollout: production-rollout.md
+  - Design:
+      - Architecture: architecture.md
+      - Invariants: invariants.md
+      - Origin story: origin-story.md
+  - Quality:
+      - Testing and verification: testing.md
+      - Product and production review: product-review.md
+  - Build and release:
+      - Cross-build static artifacts: cross-build.md
+      - Release verification: release-verification.md
+  - Decisions:
+      - ADR overview: adr/README.md
+      - 'ADR-0001: Outbound tether, not mesh': adr/0001-outbound-tether-not-mesh.md
+      - 'ADR-0002: Transport candidates (superseded)': adr/0002-transport-open.md
+      - 'ADR-0003: First egress evidence': adr/0003-egress-evidence-run1.md
+      - 'ADR-0004: Rust request transport and combined container': adr/0004-rust-request-transport-container.md
+      - 'ADR-0005: Streaming timing negative control': adr/0005-streaming-negative-control.md
+      - 'ADR-0006: HTTP framing and terminal state': adr/0006-http-framing-and-terminal-state.md
+      - 'ADR-0007: Durable hub administration and routing': adr/0007-durable-hub-administration.md
+  - Archive:
+      - Investigation index: history.md
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.details
+  - pymdownx.inlinehilite

@@ -6,7 +6,7 @@
 //! product; the control path alone is not.
 
 use anvil_ring::hub::{Registry, TetherEvent};
-use anvil_ring::tunnel::{self, ClientConfig, TunnelState};
+use anvil_ring::tunnel::{self, ClientConfig, TunnelState, MAX_CONCURRENT_STREAMS};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -50,6 +50,24 @@ fn spawn_fake_engine(port: u16, gap_ms: u64, events: Vec<&'static str>) {
     });
 }
 
+/// A low-latency engine for lifecycle tests that need many sequential requests.
+fn spawn_fast_engine(port: u16) {
+    std::thread::spawn(move || {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("engine bind");
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            use std::io::{Read, Write};
+            s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut buf = vec![0u8; 8192];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(
+                b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n",
+            );
+            let _ = s.flush();
+        }
+    });
+}
+
 /// Drive one caller request through the hub, returning the concatenated response
 /// body and the status code the caller saw.
 async fn one_request(hub_http: SocketAddr, token: &str, path: &str) -> (u16, String, Vec<f64>) {
@@ -72,8 +90,6 @@ async fn one_request(hub_http: SocketAddr, token: &str, path: &str) -> (u16, Str
     sock.write_all(req.as_bytes()).await.unwrap();
 
     let mut timings = Vec::new();
-    let mut body_out = String::new();
-    let mut status = 0u16;
     let start = std::time::Instant::now();
     let mut raw = Vec::new();
     let mut tmp = vec![0u8; 4096];
@@ -86,7 +102,7 @@ async fn one_request(hub_http: SocketAddr, token: &str, path: &str) -> (u16, Str
                 Ok(n) => {
                     timings.push(start.elapsed().as_secs_f64());
                     raw.extend_from_slice(&tmp[..n]);
-                    if raw.windows(5).any(|w| w == b"0\r\n\r\n") {
+                    if response_is_complete(&raw) {
                         break;
                     }
                 }
@@ -98,8 +114,7 @@ async fn one_request(hub_http: SocketAddr, token: &str, path: &str) -> (u16, Str
     .expect("reading response should finish");
 
     let text = String::from_utf8_lossy(&raw).to_string();
-    eprintln!("RAW WIRE ({} bytes): {:?}", raw.len(), text);
-    status = text
+    let status = text
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse().ok())
@@ -111,11 +126,53 @@ async fn one_request(hub_http: SocketAddr, token: &str, path: &str) -> (u16, Str
         .split_once("\r\n\r\n")
         .map(|(_, b)| b.to_string())
         .unwrap_or_else(|| text.clone());
-    body_out = decode_chunked(&raw_body);
+    let body_out = decode_chunked(&raw_body);
     (status, body_out, timings)
 }
 
-include!("chunked_decoder_shared.rs");
+fn response_is_complete(raw: &[u8]) -> bool {
+    let Some(head_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let body_at = head_end + 4;
+    let head = String::from_utf8_lossy(&raw[..head_end]).to_ascii_lowercase();
+    if head.contains("transfer-encoding: chunked") {
+        return raw[body_at..].windows(5).any(|w| w == b"0\r\n\r\n");
+    }
+    let length = head.lines().find_map(|line| {
+        line.strip_prefix("content-length:")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+    });
+    length.is_some_and(|length| raw.len() >= body_at + length)
+}
+
+async fn read_complete_response(socket: &mut tokio::net::TcpStream, limit: Duration) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 4096];
+    tokio::time::timeout(limit, async {
+        loop {
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(length) => {
+                    response.extend_from_slice(&chunk[..length]);
+                    if response_is_complete(&response) {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("response should finish before the test deadline");
+    response
+}
+
+#[path = "common/chunked_decoder.rs"]
+mod chunked_decoder;
+
+use chunked_decoder::decode_chunked;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_travels_the_whole_path() {
@@ -191,16 +248,77 @@ async fn a_request_travels_the_whole_path() {
         );
     }
 
-    // I-9 through the tunnel: arrivals should track the 300ms emission cadence.
-    // Relaxed vs the direct proxy (the tunnel adds a hop) but not vacuous -- a
+    // Arrivals should track the engine's 300 ms emission cadence. This threshold
+    // is relaxed for the extra tunnel hop but still detects a buffering hub, which
     // buffering hub collapses every read to one instant.
-    if timings.len() >= 3 {
+    assert!(
+        timings.len() >= 3,
+        "the full tunnel path must deliver incrementally: {timings:?}"
+    );
+    {
         let spread = timings.last().unwrap() - timings.first().unwrap();
         assert!(
             spread > 0.25,
-            "I-9: {} reads spanning {spread:.3}s means the tunnel buffered. timings={timings:?}",
+            "{} reads spanning {spread:.3}s means the tunnel buffered; timings={timings:?}",
             timings.len()
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completed_streams_release_tether_capacity() {
+    let engine_port = free_port();
+    let hub_tunnel_port = free_port();
+    let hub_http_port = free_port();
+    const TOKEN: &str = "caller-token";
+
+    spawn_fast_engine(engine_port);
+    let reg = Arc::new(Registry::new(Duration::from_secs(300)));
+    reg.register("t1", "test tether", "tunnel-cred");
+    let mut events = anvil_ring::hub::serve(
+        format!("127.0.0.1:{hub_tunnel_port}").parse().unwrap(),
+        reg.clone(),
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move { while events.recv().await.is_some() {} });
+    anvil_ring::frontend::serve_frontend(
+        format!("127.0.0.1:{hub_http_port}").parse().unwrap(),
+        reg,
+        TOKEN.to_string(),
+    )
+    .await
+    .unwrap();
+
+    let state = Arc::new(TunnelState::default());
+    let cfg = ClientConfig {
+        hub_url: format!("ws://127.0.0.1:{hub_tunnel_port}/ring"),
+        credential: b"tunnel-cred".to_vec(),
+        state: state.clone(),
+    };
+    tokio::spawn(async move {
+        let _ = tunnel::run_client(cfg, format!("http://127.0.0.1:{engine_port}")).await;
+    });
+    for _ in 0..200 {
+        if state.is_up() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(state.is_up(), "tether should have authorized");
+
+    for request in 1..=MAX_CONCURRENT_STREAMS + 2 {
+        let (status, body, _) = one_request(
+            format!("127.0.0.1:{hub_http_port}").parse().unwrap(),
+            TOKEN,
+            "/v1/models",
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "completed request {request} leaked a tether slot; body={body:?}"
+        );
+        assert_eq!(body, "ok");
     }
 }
 
@@ -226,16 +344,15 @@ async fn caller_without_token_is_refused_before_any_tunnel_use() {
     .unwrap();
 
     // No tether is connected at all: an unauthenticated caller must not even learn
-    // that, since "no upstream" leaks fleet state (I-6 ordering).
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // that, since "no upstream" would reveal service state before authentication.
+    use tokio::io::AsyncWriteExt;
     let mut sock = tokio::net::TcpStream::connect(format!("127.0.0.1:{hub_http_port}"))
         .await
         .unwrap();
     sock.write_all(b"POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\ncontent-length: 2\r\n\r\n{}")
         .await
         .unwrap();
-    let mut buf = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(3), sock.read_to_end(&mut buf)).await;
+    let buf = read_complete_response(&mut sock, Duration::from_secs(3)).await;
     let text = String::from_utf8_lossy(&buf).to_string();
     assert!(
         text.contains("401"),
@@ -247,7 +364,7 @@ async fn caller_without_token_is_refused_before_any_tunnel_use() {
 async fn authenticated_caller_with_no_tether_gets_502_not_401() {
     // The distinct answers matter: 401 says "you are not allowed", 502 says
     // "allowed, but no tether is up". Collapsing them hides fleet state from the
-    // only people who need to see it (I-6).
+    // authenticated operators who need to distinguish the two conditions.
     let hub_tunnel_port = free_port();
     let hub_http_port = free_port();
     let reg = Arc::new(Registry::new(Duration::from_secs(300)));
@@ -267,7 +384,7 @@ async fn authenticated_caller_with_no_tether_gets_502_not_401() {
     .await
     .unwrap();
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let mut sock = tokio::net::TcpStream::connect(format!("127.0.0.1:{hub_http_port}"))
         .await
         .unwrap();
@@ -276,8 +393,7 @@ async fn authenticated_caller_with_no_tether_gets_502_not_401() {
     )
     .await
     .unwrap();
-    let mut buf = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut buf)).await;
+    let buf = read_complete_response(&mut sock, Duration::from_secs(5)).await;
     let text = String::from_utf8_lossy(&buf).to_string();
     assert!(
         text.contains("502"),
@@ -370,22 +486,28 @@ async fn tether_death_midstream_ends_the_caller() {
     .await
     .unwrap();
     let mut got = vec![0u8; 64];
-    let _ = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut got)).await;
+    let first = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut got))
+        .await
+        .expect("stream should start before the tether is killed")
+        .expect("read the first response bytes");
+    assert!(first > 0, "stream ended before the tether was killed");
+    let mut wire = got[..first].to_vec();
 
     // Kill the tunnel abruptly (no close handshake).
     tether.abort();
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // The caller must reach an end, not hang: read returns 0 or errors.
+    // HTTP/1.1 keep-alive leaves the TCP connection open after this response.
+    // The response body is ended by the chunked terminator a real HTTP client
+    // consumes, not by socket EOF.
     let ended = tokio::time::timeout(Duration::from_secs(10), async {
-        let mut total = 0usize;
         loop {
             match sock.read(&mut got).await {
                 Ok(0) | Err(_) => return true,
                 Ok(n) => {
-                    total += n;
-                    if total > 100_000 {
-                        return false;
+                    wire.extend_from_slice(&got[..n]);
+                    if wire.windows(5).any(|window| window == b"0\r\n\r\n") {
+                        return true;
                     }
                 }
             }
@@ -394,12 +516,16 @@ async fn tether_death_midstream_ends_the_caller() {
     .await;
     assert!(
         matches!(ended, Ok(true)),
-        "I-6: caller must be terminated when its tether dies, not left streaming"
+        "caller response body must end when its tether dies, not stream forever"
+    );
+    assert!(
+        !wire.windows(5).any(|window| window == b"0\r\n\r\n"),
+        "a lost tether must fail the HTTP body, not fabricate a successful terminator"
     );
     // And the hub should have reported the transition rather than staying silent.
     let kinds = seen.lock().unwrap().clone();
     assert!(
         kinds.iter().any(|k| k == "Up") && kinds.iter().any(|k| k != "Up"),
-        "I-6: hub should log Up then a loss, saw {kinds:?}"
+        "hub should log Up then a loss, saw {kinds:?}"
     );
 }

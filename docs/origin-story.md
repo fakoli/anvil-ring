@@ -1,89 +1,95 @@
-# Origin story: anvil-ring
+# Origin story
 
-*De-identified for public release. No hostnames, tokens, or account details appear
-in this document or anywhere in this repository.*
+Anvil Ring began with a narrow operational problem: a model server was ready to
+run on rented GPU capacity, but the rental could not safely join the trusted
+network or accept inbound traffic.
 
-## The problem this started from
+This page explains why the product is an outbound tether, how it works with
+Anvil Serving, and why it is named Anvil Ring.
 
-The serving tier was built to run on hardware we own: a workstation, a mini, a
-machine with a name we chose and a network we control. Reaching those boxes is a
-solved problem — they are on our network, they have names, and the names resolve.
+## The problem
 
-Renting a GPU is the opposite situation. The machine has no name we picked, it
-sits behind a cloud provider's firewall, we cannot open inbound ports, we often
-cannot install a system service, and on some providers we cannot get a TUN
-interface at all. And it is temporary: the rental ends, the container goes away,
-and the next one has a different address.
+A model-serving host that an operator owns has a stable identity, a known
+network boundary, and a lifecycle the operator controls. A GPU rental has the
+opposite properties:
 
-The obvious answer is "put it on the same private network as everything else."
-That answer has a hidden cost worth naming out loud: to use it you must run a
-network daemon on a machine you do not own and will not keep, and the thing you
-actually wanted — one HTTPS endpoint serving one model — is now accompanied by a
-whole mesh network, a relay anycast system, and a hole-punching stack, none of
-which your workload asked for.
+- the host is short-lived and its address may change with every allocation;
+- provider policy may prevent inbound firewall changes or port publication;
+- the workload may run without root privileges, system services, or a TUN
+  device; and
+- persistent machine identity and long-lived private keys are poor fits for a
+  disposable container.
 
-## The observation that changed the design
+The requirement was not general network membership. It was one authenticated,
+streaming HTTP path to a loopback model endpoint.
 
-A rented GPU box is usually **already publicly reachable**. The hard problem that
-a mesh network exists to solve — two machines that neither can accept a
-connection from the other — mostly does not apply here. The awkward party is the
-one we control.
+## The design observation
 
-So the topology is not a mesh. It is a **tether to a place we already trust**.
-The container does not wait to be found. It calls home, over a connection it
-initiated, and holds the line open. Everything we want to reach it with rides
-back down that line, in the direction that never required anyone to open a port.
+The rental is still able to initiate outbound connections. That changes the
+topology.
 
-That is the entire trick, and it is old: it is the reason a client can reach a
-server behind NAT, and the reason your browser works behind a router nobody
-configured. We just pointed it at our own infrastructure instead of a website.
+Instead of asking the trusted side to discover or dial the rental, the rental
+dials an always-on hub and keeps an authenticated session open. Caller requests
+travel from the hub over that existing session. The rental never opens a
+listener, and it never asks for a target, route, or permission.
 
-## Why the name is a piece of a smithy
+This is intentionally smaller than a VPN:
 
-The family is named for the forge, so the fourth member had to be too.
+- no overlay address space;
+- no virtual network interface;
+- no many-to-many routing;
+- no remote network daemon with broad reach; and
+- no authority on the disposable side to expand access.
 
-A **ring** is the rope on a farrier's anvil stand. The anvil is heavy, immovable,
-and sits at the center of the shop. The ring is on the *far side* of it. You stand
-anywhere in the shop, pull the rope, and the anvil answers with a sound — a
-signal you send outward that produces a response from a fixed, known point.
+The smaller contract makes the security boundary testable. The hub owns
+registration, authorization, routing, leases, and revocation. The tether owns
+only an outbound connection and access to one loopback upstream.
 
-That is exactly the shape of this thing: we are not moving the anvil, and we are
-not building a second one somewhere else. We are running a line from wherever the
-work happens back to the place that answers.
+## Why “Ring”
 
-It also fits the family's division of labor without straining:
+The name refers to the audible ring of an anvil: a signal that carries beyond
+the forge while the anvil itself remains fixed in place. In the same way, Anvil
+Ring does not move the serving system or make the rental a general network peer.
+It provides a narrow signal path back to infrastructure the operator already
+trusts.
 
-| Repo | Asks |
-|---|---|
-| `anvil` | who is working |
-| `anvil-serving` | what is running |
-| `anvil-events` | what happened |
-| `anvil-ring` | can we reach it |
+The name also states the product's narrow question: can an authorized caller
+reach a serving endpoint that accepts no inbound connection?
 
-## What it deliberately is not
+## How Anvil Ring and Anvil Serving work together
 
-**Not a VPN, and not trying to be one.** There is no overlay network, no virtual
-interface, no address space to plan, and no daemon to install on the remote host.
-If you need arbitrary bidirectional routing between many machines, you want a
-real VPN and should use one; this is a smaller tool with a smaller blast radius.
+Anvil Serving and Anvil Ring operate at different layers.
 
-**Not peer-to-peer.** There is one always-on side (our own network) and one
-disposable side (the rental). The always-on side is where authentication, ACLs,
-and bookkeeping live, because that is the side we can audit.
+[Anvil Serving](https://fakoli.github.io/anvil-serving/) stores model artifacts,
+starts and stops serving processes, records qualification evidence, and maps
+stable capability names to model configurations through its gateway. Its
+[main project portal](https://github.com/fakoli/anvil-serving) contains the
+source and release history.
 
-**Not a general tunnel service.** It exists to expose a model server's port. The
-transport underneath is swappable and boring on purpose — the value is in the
-lifecycle around it: registration, identity across restarts, health, and knowing
-when a tether has gone dead.
+Anvil Ring owns the reachability path for a serving endpoint that must remain
+loopback-only on an outbound-only host. The configured Ring upstream may be:
 
-## The constraint that keeps it honest
+1. a direct vLLM or SGLang endpoint; or
+2. the loopback Anvil Serving gateway, when capability routing and serving
+   policy should remain in Anvil Serving.
 
-The remote side has **no privileges and no persistence assumptions**. It runs as
-an unprivileged user in a container, holds a re-registrable token rather than a
-baked key, opens no listening ports, and loses all access the moment the token is
-revoked. Nothing about joining succeeds only if the operator happened to grant
-root.
+In the second topology, Ring carries the HTTP request and preserves streaming.
+Anvil Serving still maps the requested capability name to a model configuration.
+Ring does not change that mapping, select a fallback model, start or stop a
+model, or allocate GPU capacity.
 
-That constraint is the reason the design is a tether and not a tunnel we manage
-from the remote end. It is also the reason the name is about a rope you pull
-rather than a door you open.
+The Anvil Ring [documentation portal](https://fakoli.github.io/anvil-ring/) and
+[main project portal](https://github.com/fakoli/anvil-ring) cover the transport
+and its operational boundary.
+
+## The governing constraint
+
+The remote side assumes no privilege and no persistence. It runs as an
+unprivileged process, opens no listening port, accepts a re-registrable
+credential through a file or environment input, and loses access when the hub
+revokes or expires the session.
+
+That constraint is not an implementation detail. It is the reason Anvil Ring is
+an outbound tether rather than a remotely managed network endpoint, and it is
+the standard against which every future registration, routing, or
+administration feature must be reviewed.

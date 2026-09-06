@@ -1,28 +1,19 @@
-# anvil-ring — FUSED serving image (ADR-0004, decision 2).
-#
-# One image = one `docker run` = vLLM/SGLang behind anvil-ring, reachable from
-# our network with no port-forwarding, no inbound rules, and no TUN/root on the
-# rental (I-1, I-2).
-#
-# ADR-0004 records the costs of fusing knowingly: release cadence is coupled to
-# the engine's, a proxy-only fix republishes a multi-GB artifact, and the image
-# already ships uvicorn/starlette so this adds a second HTTP stack. The
-# mitigation is a hard constraint, not a preference: the binary is statically
-# linked and reads config only from its own environment, so converting to a
-# sidecar later is a one-line COPY change rather than a refactor.
-#
-# Build the binary in the builder stage below, for a musl target so it runs
-# regardless of the base image's glibc version:
-#   aarch64-unknown-linux-musl / x86_64-unknown-linux-musl
+# Fused rental-side image: a loopback-only vLLM engine plus the outbound tether.
+# The base image must be pinned explicitly, preferably by digest:
+#   docker build --build-arg VLLM_IMAGE=vllm/vllm-openai:<tag>@sha256:<digest> ...
 
-ARG BUILDPLATFORM=linux/amd64
-FROM --platform=$BUILDPLATFORM rust:1.85-alpine AS build
+ARG TARGETPLATFORM
+ARG VLLM_IMAGE
+
+# Build under the target platform (emulated when necessary). Building under
+# BUILDPLATFORM and selecting the target with `uname -m` produced the builder's
+# architecture, not the image architecture.
+FROM --platform=$TARGETPLATFORM rust:1.85-alpine AS build
 RUN apk add --no-cache musl-dev
 
 WORKDIR /src
 COPY cargo/Cargo.toml cargo/Cargo.lock ./
 COPY cargo/src ./src
-# Pick the musl target matching the build platform; rustup knows the triple.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     set -eux; \
     ARCH="$(uname -m)"; \
@@ -34,24 +25,27 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     rustup target add "$TARGET"; \
     cargo build --release --locked --target "$TARGET" --bin anvil-ring
 
-ARG VLLM_IMAGE=vllm/vllm-openai
 FROM ${VLLM_IMAGE}
 
-# I-10: the engine MUST bind loopback. anvil-ring is the only thing allowed to
-# reach it, so authz lives in exactly one place and there is one thing to audit.
-ENV VLLM_HOST=127.0.0.1 \
-    ANVIL_RING_LISTEN=0.0.0.0:8080 \
+USER root
+
+# vLLM's supported container command is `vllm serve`. The supervisor adds the
+# mandatory loopback host/port and starts `anvil-ring tether` beside it.
+COPY --from=build /src/target/*/release/anvil-ring /usr/local/bin/anvil-ring
+COPY deploy/entrypoint.py /usr/local/bin/anvil-ring-entrypoint
+RUN chmod 0755 /usr/local/bin/anvil-ring /usr/local/bin/anvil-ring-entrypoint \
+    && mkdir -p /home/vllm/.cache /home/vllm/.config \
+    && chown -R 2000:0 /home/vllm \
+    && (grep -Eq '^[^:]*:[^:]*:2000:' /etc/passwd \
+        || echo 'anvil-ring:x:2000:0:Anvil Ring:/home/vllm:/bin/sh' >> /etc/passwd)
+
+ENV HOME=/home/vllm \
     ANVIL_RING_UPSTREAM=http://127.0.0.1:8000
 
-# Static binary. `scratch`-style COPY of a musl build has no runtime deps to
-# satisfy, which is the point of I-7.
-COPY --from=build target/*/release/anvil-ring /usr/local/bin/anvil-ring
+# Numeric non-root identity works even when a pinned older base image lacks the
+# newer named `vllm` account. No TUN device, privileged port, or capability is
+# required.
+USER 2000:0
 
-# Non-root (I-2). The proxy needs no privileges: no bind below 1024, no TUN, no
-# CAP_NET_ADMIN.
-USER nobody
-
-# NOTE for anyone tempted to add EXPOSE 8000: that would advertise the engine
-# port, which is the opposite of the design. Only anvil-ring's listener exists,
-# and even that is reached over an OUTBOUND tunnel (I-1), not a published port.
-ENTRYPOINT ["/usr/local/bin/anvil-ring", "proxy"]
+# No EXPOSE: the engine binds loopback and the rental accepts no inbound traffic.
+ENTRYPOINT ["/usr/local/bin/anvil-ring-entrypoint"]

@@ -6,7 +6,7 @@
 //!
 //! Design note: these assert on properties that are true under `ring` and false under
 //! the two alternatives (no provider, or aws-lc re-added). A guard that could only
-//! agree with the wanted answer has no teeth -- see tests/negative_control.rs for the
+//! agree with the wanted answer has no teeth -- see ADR-0005 for the streaming
 //! project's convention on that.
 
 /// The provider must resolve implicitly. We never call `install_default()`, and

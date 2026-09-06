@@ -1,65 +1,87 @@
-# Invariants
+# Architectural guarantees
 
-These are the properties anvil-ring must never violate. A change that breaks one
-is a design change, not a bug fix, and needs an ADR.
+These requirements define Anvil Ring's security and runtime behavior. A change
+that breaks one changes the product's design and requires an architecture
+decision record that explains the reason, tradeoffs, and migration plan.
 
-## I-1 — Outbound only
+## Rental connections are outbound only
+
 The remote (disposable) side MUST NOT listen on any port or accept any inbound
 connection. Every connection is initiated by the remote side toward the hub.
-This is what makes "no port-forwarding on a cloud we don't control" true rather
-than aspirational.
+This lets an operator reach a rental without enabling provider port forwarding.
 
-## I-2 — No privileges on the remote side
+## The rental process requires no elevated privileges
+
 The client MUST run as an unprivileged user with no `CAP_NET_ADMIN`, no TUN
 device, no kernel module, and no system service. If a feature only works with
-root on the remote host, the feature is wrong.
+root on the remote host, it violates the product boundary.
 
-## I-3 — Revocation is effective
+## Credential revocation ends access
+
 A revoked token MUST stop working within one reconnect interval, and MUST NOT
 be able to keep an already-established tunnel alive indefinitely. Idle tunnels
 have a bounded lifetime.
 
-## I-4 — Identity is re-registrable, not baked
+## Rental identity is registered at runtime
+
 Ephemeral hosts get a short-lived credential bound to a registration, not a
-long-lived key committed to an image. Restarting the container re-registers; it
-does not reuse a stale identity silently.
+long-lived key committed to an image. Durable administration MUST support
+registration and rotation without baking identity into the rental image. The
+local `anvil-ring admin` command and SQLite state implement this control; its
+persistence, lifecycle, and multi-tether behavior are locally verified; target
+dependent rollout evidence remains open.
 
-## I-5 — The hub is the only authority
-Authorization decisions (which tether may expose which port, to whom) are made
-on the always-on side only. The remote side is never trusted to self-describe
-its own permissions.
+## The hub controls authorization and routing
 
-## I-6 — A dead tether is observable
+Authorization and routing decisions are made on the always-on side only. The
+remote side is never trusted to select a registration, caller population,
+routable target, lease, or permission.
+
+## A disconnected tether ends affected requests
+
 A lost tether MUST be distinguishable from a slow one within a stated timeout,
-and MUST surface as an explicit state transition rather than an endpoint that
-hangs. Silent half-open tunnels are the failure mode this project exists to
-avoid, since a hung model endpoint looks identical to a slow model.
+and MUST be reported as an explicit state transition rather than an endpoint that
+hangs. Every in-flight caller response must end when its tether disconnects.
 
-## I-7 — One self-contained binary, no install step  *(redefined by ADR-0004)*
-The remote-side binary MUST be a single statically-linked, self-contained artifact
+## The rental uses one self-contained executable
+
+The remote-side binary MUST be one statically linked, self-contained artifact
 that requires **no separately installed runtime or package** on the host.
-Vendored, source-audited crate dependencies compiled into that artifact are
-permitted, and `Cargo.lock` is committed so the exact tree is inspectable.
+Vendored crate dependencies compiled into that artifact are permitted, and
+`Cargo.lock` is committed so the exact tree is reviewable.
 
-Rationale, unchanged from the original stdlib-only rule: the client ships into
-third-party environments and a dependency *install step* is supply-chain surface
-imported onto someone else's GPU box. A static binary with an audited lockfile has
-a smaller and more inspectable surface than `pip install`-ing a shim, so this form
-serves the original intent better.
+The client runs in third-party environments. Installing packages at deployment
+time would add a separate supply-chain operation on the rental. A static binary
+and committed lockfile keep the deployed dependency set reviewable.
 
-## I-8 — No secret in a URL, header-for-cache, or argv
-Tokens MUST NOT appear in URLs, must not be echoed in logs, and MUST NOT be
-passed as command-line arguments (argv is visible in `ps` and in shell history on
-the shared rental host). Read from env or a file descriptor.
+## Secrets stay out of URLs, command arguments, and logs
 
-## I-9 — Streaming must not buffer
+Registration credentials and caller tokens MUST NOT appear in URLs, logs, or
+command-line arguments. Process arguments are visible in tools such as `ps` and
+may remain in shell history on a shared rental. Runtime secrets come from
+environment variables or files. Caller authentication uses the HTTP
+`Authorization` header and must not move into a query parameter or another
+cache-prone location.
+
+## Streaming responses are delivered incrementally
+
 Every chunk received from the inference engine MUST be flushed to the caller
 immediately. Buffered SSE presents as elevated time-to-first-token and is
-indistinguishable from a slow model, so a buffering bug fails silently and will be
-misattributed. A regression test MUST assert incremental arrival, not merely
-eventual completeness.
+indistinguishable from a slow model. A regression test MUST measure incremental
+arrival rather than only checking the completed response body.
 
-## I-10 — The engine port is reachable only by the proxy
-vLLM/SGLang MUST bind loopback and MUST NOT be directly reachable by anything
-except the anvil-ring process in the same network namespace. Authentication is
-enforced at the proxy and nowhere else, so there is exactly one place to audit.
+## The serving upstream listens on loopback only
+
+The direct vLLM/SGLang engine or Anvil Serving gateway MUST bind loopback and
+MUST NOT be published from the rental. Ring enforces caller authentication at
+its frontend. Additional upstream authentication is permitted only when its
+token contract is intentionally compatible with the end-to-end
+`Authorization` header; Ring does not perform credential exchange.
+
+## The caller receives the upstream's actual result
+
+The caller MUST receive the engine's real status and end-to-end headers. No
+response head is a tunnel failure, not an empty `200 OK`; an incomplete body is
+an explicit end/failure, not a successful-looking truncation. Each HTTP hop may
+remove or regenerate hop-by-hop framing, but it MUST NOT invent model output or
+rewrite an engine error into success.

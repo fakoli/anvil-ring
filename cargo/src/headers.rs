@@ -112,7 +112,7 @@ mod tests {
 
         assert!(!h.contains_key("x-session-token"));
         assert!(!h.contains_key("foo"));
-        // Authorization is end-to-end and MUST pass through (I-10 auth gate).
+        // Authorization is an end-to-end header and must pass through.
         assert!(h.contains_key("authorization"));
     }
 

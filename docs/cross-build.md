@@ -1,60 +1,83 @@
-# Cross-compiling the static Linux binary (I-7) from macOS
-#
-# Problem: `cargo build --target aarch64-unknown-linux-musl` on macOS fails at
-# LINK time, not compile time:
-#
-#   ld: unknown options: --as-needed -Bstatic -Bdynamic --eh-frame-hdr -z --gc-sections ...
-#   clang: error: linker command failed
-#
-# Cause: cargo uses `cc` as the linker for the musl target, and on macOS `cc` is
-# clang driving Apple's linker, which does not understand GNU ld flags. The Rust
-# code compiles fine; there is no source problem here.
-#
-# This is exactly why the Dockerfile cross-builds in a Linux builder stage rather
-# than on the operator's laptop.
+# Static Linux builds from macOS
 
-## Option A — Docker (recommended, matches deploy/Dockerfile)
+The shipped rental binary must be a self-contained, statically linked executable
+with no rental-side package installation. A direct macOS
+`cargo build --target *-unknown-linux-musl` compiles Rust but normally fails at
+link time because Apple's linker does not understand GNU/musl linker flags.
+
+## Canonical path: CI
+
+`.github/workflows/release-artifact.yml` builds both supported targets in a
+native-target Alpine container:
+
+- `aarch64-unknown-linux-musl`
+- `x86_64-unknown-linux-musl`
+
+The workflow requires the expected architecture, accepts static or static-PIE
+wording from `file`, rejects a `PT_INTERP` loader segment with `readelf`, and
+checks that `ldd` resolves no dynamic dependencies.
+
+Each architecture's download contains a tar archive, SHA-256 manifests, a
+CycloneDX Cargo dependency inventory, `Cargo.lock`, `LICENSE`, and source
+identity. The tar archive preserves executable permissions. Unpack that archive
+before installing the binary; GitHub's artifact download itself may reset file
+permissions.
+
+After the build and test jobs pass, trusted `main` and version-tag runs sign
+provenance and SBOM attestations and upload an `anvil-ring-<arch>-attested`
+artifact with the signature bundles. Pull requests produce unsigned build
+artifacts. The workflow does not create a GitHub Release or deploy a service.
+See [Release verification](release-verification.md) for verification commands
+and the remaining hosted-workflow evidence. Do not improvise a release builder
+on a fleet-service host.
+
+## Combined vLLM-and-tether container image
+
+The repository Dockerfile builds the Rust binary under the target platform and
+copies it into an explicitly selected vLLM base:
 
 ```bash
-cd <repo root>
-docker build -f deploy/Dockerfile --build-arg VLLM_IMAGE=vllm/vllm-openai .
-# or build just the binary, no engine image pulled:
-docker run --rm -v "$PWD/cargo":/src -w /src rust:1.85-alpine sh -c \
-  'apk add --no-cache musl-dev \
-   && rustup target add aarch64-unknown-linux-musl \
-   && cargo build --release --locked --target aarch64-unknown-linux-musl --bin anvil-ring'
+docker buildx build \
+  --platform linux/amd64 \
+  -f deploy/Dockerfile \
+  --build-arg 'VLLM_IMAGE=vllm/vllm-openai:<tag>@sha256:<digest>' \
+  -t anvil-ring-vllm:amd64 .
 ```
 
-The artifact lands in `cargo/target/aarch64-unknown-linux-musl/release/anvil-ring`.
-Verify it is really static:
+Use `linux/arm64` for an aarch64 rental. The base image is intentionally a
+required build argument: silently following `latest` would make the multi-GB
+runtime and its launcher behavior non-reproducible.
+
+Building under `TARGETPLATFORM` is slower when Docker needs emulation, but it
+avoids the previous error where `FROM --platform=$BUILDPLATFORM` plus `uname -m`
+selected the builder's architecture and mislabeled the final image.
+
+## Binary-only local container build
+
+On a machine capable of running the target architecture (natively or through
+configured emulation):
+
+```bash
+docker run --rm --platform linux/arm64 \
+  -v "$PWD/cargo:/src" -w /src \
+  rust:1.85-alpine sh -c '
+    apk add --no-cache musl-dev
+    rustup target add aarch64-unknown-linux-musl
+    cargo build --release --locked \
+      --target aarch64-unknown-linux-musl --bin anvil-ring
+  '
+```
+
+Change both platform and target to x86-64/`x86_64-unknown-linux-musl` for amd64.
+
+## Verify an artifact
 
 ```bash
 file cargo/target/aarch64-unknown-linux-musl/release/anvil-ring
-# expect: statically linked (no dynamic dependencies)
+readelf -l cargo/target/aarch64-unknown-linux-musl/release/anvil-ring \
+  | grep INTERP && echo 'unexpected dynamic loader'
 ```
 
-## Option B — a cross toolchain on the host
-
-Install `messense/rust-musl-cross` tap, then point cargo's musl linkers at it:
-
-```bash
-brew tap messense/musl-cross && brew install messense/musl-cross/musl-cross
-cat >> .cargo/config.toml <<'EOF'
-[target.aarch64-unknown-linux-musl]
-linker = "aarch64-linux-musl-gcc"
-rustflags = ["-C", "target-feature=+crt-static"]
-[target.x86_64-unknown-linux-musl]
-linker = "x86_64-linux-musl-gcc"
-rustflags = ["-C", "target-feature=+crt-static"]
-EOF
-cargo build --release --target aarch64-unknown-linux-musl --bin anvil-ring
-```
-
-Not installed on this machine as of 2026-08-28, so Option A is the verified path.
-
-## CI note
-
-CI runs on Linux, so this failure mode does not exist there — add
-`cargo build --release --target <musl triple>` to the release job and the
-`file` check above as the gate that enforces I-7.
-
+The second command should print no `INTERP` row. A local macOS unit and
+integration suite cannot verify the architecture or static-link properties of a
+Linux release artifact.

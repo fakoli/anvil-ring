@@ -8,3 +8,6 @@ target/
 *egg-info/
 build/
 dist/
+site/
+/cargo/*.cdx.json
+/graphify-out/

@@ -1,49 +1,57 @@
-# ADR-0002: Transport for the tether — NOT DECIDED
+# ADR-0002: Transport candidates (superseded)
 
-- **Status:** **Open / blocked on a decision**
+- **Status:** **Superseded by ADR-0004**
 - **Date:** 2026-08-27
 
-This is deliberately left un-decided. Nothing in this repo is allowed to
-"temporarily pick one" — code that quietly assumes a transport is how projects
-like this end up with a migration they never scheduled.
+ADR-0004 selected an owned binary WebSocket tunnel implemented in Rust. The
+candidate analysis below is retained as decision history; no implementation
+decision remains open. Provider network probes still verify that a rental image
+can reach the selected hub, but they do not reopen the transport choice.
+
+At the time of this decision, the transport was deliberately left open. The
+team did not allow an interim implementation to become an accidental permanent
+choice. That constraint is historical; ADR-0004 subsequently selected the owned
+Rust WebSocket transport.
 
 ## Candidates
 
 ### A. `chisel` (TCP-over-WebSocket, reverse mode)
 - **For:** single static binary, no root, no TUN, and because it rides WSS/443 it
   survives egress that permits only HTTPS — the scenario most likely to bite on a
-  random provider. Built-in reverse mode is exactly I-1.
-- **Against:** adds a third-party binary to the tether path (supply-chain surface
-  on someone else's GPU box, which is the argument behind I-7); authZ is thin, so
-  our hub must do the real authorization work around it.
+  random provider. Built-in reverse mode preserves the outbound-only rental
+  requirement.
+- **Against:** adds a separately sourced third-party binary to the rental, which
+  conflicts with the self-contained-executable requirement. Its authorization
+  model would still require the hub to enforce Anvil Ring registrations and
+  routes.
 
 ### B. `ssh -R` / autossh to a hub sshd
 - **For:** no new dependency, mature auth (keys, certs, revoke-by-authorized_keys),
   everyone has already operationalized sshd.
 - **Against:** port 22 egress is *less* likely to be open on a restrictive
-  provider than 443. Key management for ephemeral nodes is fiddly, and
-  `GatewayPorts` semantics are a footgun.
+  provider than 443. Key management for ephemeral nodes is operationally
+  complex, and `GatewayPorts` can unintentionally widen exposure.
 
 ### C. Own stdlib WebSocket/HTTP multiplexed tunnel in the client
-- **For:** satisfies I-7 literally — no third-party binary in the path. Full
-  control of framing, so health, backpressure, and I-6 detection are first-class
+- **For:** requires no third-party binary in the path. Full control of framing
+  makes health, bounded flow control, and tether-disconnection detection
   rather than inferred.
-- **Against:** we are then writing and owning a tunnel. That is the real cost, and
-  it is paid in correctness bugs at 3 a.m.
+- **Against:** the project assumes full ownership of tunnel correctness,
+  interoperability, and incident response.
 
-## What would settle it
+## Historical selection criteria
 
 Both of these must be true before choosing:
 
 1. **Which transports do the target providers actually permit?** Not "usually" —
    run a probe from a real rental and record the answer. 443-only egress is the
    common case; if 22 is reliably open, B gets much stronger.
-2. **Does I-7 (stdlib-only) bind the *tunnel* or only the *client logic*?** If an
+2. **Must every tunnel dependency be compiled into the shipped executable?** If an
    external binary is disallowed anywhere in the tether path, A is out and the
    real choice is B vs. C.
 
-## Interim
+## Historical interim state
 
-The CLI in this repo exposes no transport flag and implements none. The first
-implementation PR must either resolve this ADR or add a probe that produces
-evidence for it — see STATE.md next-steps.
+At the time of this ADR the CLI exposed no transport flag and implemented none.
+That statement describes the 2026-08-27 repository only; the current Rust
+runtime ships the WebSocket transport documented in ADR-0004.

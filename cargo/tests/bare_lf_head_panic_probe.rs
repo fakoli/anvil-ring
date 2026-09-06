@@ -26,7 +26,7 @@ fn bare_lf_terminated_head_does_not_panic() {
     let s = String::from_utf8_lossy(&out);
 
     // Whatever the framing decision, the head must survive and stay parseable --
-    // a mangled head is how a wrong status code reaches a caller (I-11).
+    // a mangled head can send the wrong status code to a caller.
     let (res, rest) = anvil_ring::hub::parse_head(&out)
         .unwrap_or_else(|| panic!("reframed head no longer parses: {s:?}"));
     assert_eq!(res.status(), hyper::StatusCode::OK);

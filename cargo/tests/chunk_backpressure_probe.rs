@@ -1,4 +1,4 @@
-//! Can `TunnelBody::Live` be driven to completion in ONE poll?
+//! Can `TunnelBody::Live` drain every queued chunk before reporting completion?
 //!
 //! Field measurement that motivated this: with a 6-event engine spread over ~10s,
 //! the hub received all 6 DATA frames plus END, yet the caller received exactly
@@ -10,8 +10,8 @@
 //! hyper can serve an entire response within a single `poll_frame` drive. If our
 //! body returns `Ready(None)` while the channel still holds data, the response
 //! ends early and the remaining bytes are stranded -- which is exactly the
-//! symptom. This test reproduces the shape WITHOUT any networking, so it is the
-//! cheapest place to see the defect.
+//! symptom. These are retained as regressions for the fixed body-lifetime and
+//! channel-drain contract, without needing the network harness.
 
 use anvil_ring::frontend::TunnelBody;
 use anvil_ring::hub::ChunkOrEnd;

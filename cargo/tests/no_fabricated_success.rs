@@ -1,4 +1,4 @@
-//! I-11: a stream with no upstream head must not reach the caller as a success.
+//! A stream with no upstream response head must not reach the caller as a success.
 
 use anvil_ring::frontend::caller_status_for;
 use hyper::StatusCode;

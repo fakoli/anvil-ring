@@ -24,8 +24,8 @@ that a poor fit:
 
 Do not build or embed a mesh. Build a **tether**: the remote side maintains one
 outbound connection to an always-on hub we operate, and mapped ports are reached
-by multiplexing over that connection. Directionality is enforced by invariant
-(I-1), not by convention.
+by multiplexing over that connection. The rental's outbound-only behavior is
+enforced by construction, not by convention.
 
 The overlay network remains where it already is — on the hub side, which we
 already operate and audit. anvil-ring terminates *into* that network and thereby
@@ -36,8 +36,9 @@ inherits good names without asking any rental to host a network daemon.
 **Positive**
 - No inbound firewall rules, no provider networking permissions, no root.
 - Blast radius of a compromised rental is one mapped port with a revocable
-  credential (I-3), not membership in a network.
-- The hub is a single enforcement point for authZ (I-5).
+  credential, not membership in a network. Revoking the credential prevents a
+  new authorization lease.
+- The hub is the single enforcement point for authorization and routing.
 
 **Negative, accepted**
 - Hub is a single point of failure for new connections. Existing tunnels survive
@@ -53,8 +54,9 @@ inherits good names without asking any rental to host a network daemon.
 - **Embed a VPN node per rental.** Buys hole punching and relay anycast that this
   workload does not need, and requires a privileged daemon on an unowned host.
 - **Rebuild the mesh from primitives (libp2p DCUtR / Circuit Relay v2).** Has the
-  right pieces; would require reimplementing the relay placement, control plane,
-  and ACL model. Wrong substrate for one HTTP server with long-lived streams.
+  right pieces but would require reimplementing relay placement, persistent
+  membership administration, and access-control lists. That complexity is not
+  justified for one HTTP server with long-lived streams.
 - **Provider-side public exposure with a token.** Rejected outright: puts a
-  permanent public attack surface on a machine holding model weights and no
-  durable patch story.
+  permanent network entry point on a machine that holds model weights and has
+  no defined security-patch process.

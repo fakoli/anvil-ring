@@ -1,0 +1,5 @@
+# Documentation-only dependencies; these are not runtime requirements.
+Markdown==3.10.3
+mkdocs==1.6.1
+mkdocs-material==9.7.7
+pymdown-extensions==11.0.2

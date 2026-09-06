@@ -1,304 +1,266 @@
-# anvil-ring — STATE
+# Anvil Ring current state
 
-## THE TRUNCATION BUG IS FOUND AND FIXED (2026-08-28)
+**Updated:** 2026-09-05
 
-**Root cause (measured, not inferred): the response body outlived the stream it
-reads from.**
+**Runtime:** Rust `anvil-ring` executable
 
-In `frontend::handle`, `forwarded: Forwarded` was a local. The handler built
-`Response::builder().body(TunnelBody::live(rx))` and returned; `forwarded` was
-dropped at the end of the function — **before hyper had written the body**.
-`Forwarded` owns `StreamGuard`, whose `Drop` unregisters the stream from the
-session map *and* releases the stream's channel sender. Once the map's handle was
-gone too, every sender for the caller's chunk channel was dead, so `recv()`
-returned `None`, and the body ended.
+**Python package:** diagnostics-only `anvil-ring-tools`
 
-Traced directly:
-```
-GUARD drop id=1 completed=false     <-- guard torn down while the engine streamed
-BODY poll_next -> Chunk  (exactly once)
-BODY poll_next -> END               <-- body ended via None, not via the engine's END
-```
-There is only ONE `ChunkOrEnd::End` send site in the codebase (the hub's END
-handler), so the early end could only come from `Poll::Ready(None)` = every sender
-dropped.
+**Deployment status:** controlled single-rental pilot only; unattended and
+multi-rental deployment are not approved
 
-That one teardown explains all three field symptoms at once: one event delivered,
-a chunked terminator the engine never sent, and no FIN on the caller's socket.
+## Implemented request path
 
-**Fix:** tie the stream's lifetime to the response that consumes it.
-`TunnelBody::Live` now carries `Arc<Forwarded>`, and `TunnelBody::from_forwarded`
-builds the body by consuming the `Forwarded`. Nothing else about the data path
-changed.
+The complete single-tether path works in local end-to-end tests:
 
-**Verification (clean build, engine emitting 6 events ~1 s apart):**
-```
-[+0.00s] head          [+3.44s] data: ev03
-[+1.15s] data: ev01    [+4.45s] data: ev04
-[+2.29s] data: ev02    [+5.60s] data: ev05
-[+6.69s] 0\r\n\r\n     TOTAL events: 6
-```
-Each event arrives as the engine emits it (I-9 holds), and the terminator is the
-engine's own, not synthesized (I-11). Drain-to-EOF: **6/6**.
-`a_request_travels_the_whole_path` passes again — it had failed continuously
-since `a1a07a2`.
+1. a rental-side tether creates an outbound WebSocket connection to the hub;
+2. the hub authorizes it against durable registrations (or an explicit demo registration);
+3. the caller frontend authenticates a bearer token before revealing tether
+   state;
+4. the hub sends the caller's HTTP request through the tether;
+5. the tether opens one loopback connection to the configured model server;
+6. the caller receives the model server's status, end-to-end headers, and body;
+   and
+7. completion, cancellation, revocation, overload, engine failure, or tether
+   disconnection ends the affected stream and releases its tasks and queues.
 
-## What was ALSO real earlier today (do not re-litigate)
-- **Tunnel `select!` starvation — fixed, A/B-proven.** With `biased;` the pump did
-  ONE read ever; without it, seven. The closed-channel `from_hub.recv()` arm was
-  permanently ready and cancelled the engine-read arm every pass. Fixed by latching
-  the arm off (`recv(), if !from_hub_done` + `None => from_hub_done = true`). This
-  moved the hub from 1/6 to 6/6 DATA frames received.
-- **`biased` is not itself the defect.** With the arm correctly disabled, biased
-  only changes ordering. The defect was the permanently-ready arm.
+The executable supports four modes:
 
-## Wrong conclusions I recorded and later disproved (kept so they aren't re-trusted)
-- `9f24d8e` "the terminator is fabricated by the tether; ChunkedDecoder end-detection
-  misfires" — **FALSE.** The decoder's own unit test passes (`done=false` after one
-  chunk). Its commit message still asserts this; read this file instead.
-- "removing `biased` changes nothing" — measured on a broken no-op `None` arm, so
-  the comparison was invalid. Corrected in `46b2ed1`.
-- The `StreamGuard` "fix" `drop(self.chunk_tx.clone())` — a **no-op**: it drops the
-  clone, not the field. Reverted in `81f6c37`.
-- Stream-id reuse (`remove(&self.id)` in `StreamGuard::drop`) — a REAL latent sharp
-  edge, but measured NOT to be tonight's bug: the id-reuse test passed (caller B got
-  its full stream after caller A abandoned). Worth hardening (unregister by identity,
-  not key), not urgent.
+- `anvil-ring proxy`: authenticated local reverse proxy without a tunnel;
+- `anvil-ring hub`: tether WebSocket listener and optional authenticated caller
+  frontend; and
+- `anvil-ring tether`: outbound rental client that forwards only to loopback; and
+- `anvil-ring admin`: local OS-authenticated registration and credential administration.
 
-## REMAINING FAILURE: I-6 -- FULLY CHARACTERIZED (not a test artifact)
+The Python package installs only `anvil-ring-probe-egress`; it cannot replace or
+shadow the Rust runtime command.
 
-`tests/i6_tether_death_probe.rs` measures it. After killing the tether's task:
-**bytes kept arriving for 65 s (3,287 B)** and the caller never terminated.
+## Verified behavior
 
-Mechanism: `tunnel::run_client` does `ws.split()` (tunnel.rs:175), so the writer
-task owns the socket's sink half. Cancelling the client task leaves the TCP
-connection OPEN, so the hub keeps reading -- the engine's PONGs refresh
-`last_seen`, so the 45s liveness watchdog can never fire, because from the hub's
-side the tether really IS alive. My cleanup sits at the session loop's exit, which
-this path never reaches (instrumented: 74x `stream.next -> Some(Ok(..))`, never
-None/Err, and `I-6 teardown:` never printed).
+- Caller and tether authentication are separate. Missing or incorrect caller
+  authentication returns 401 before the frontend reports whether a tether is
+  available.
+- An authenticated caller with no available tether receives 502.
+- Model-server 4xx and 5xx statuses and end-to-end headers reach the caller.
+  Missing response headers never become an invented `200 OK`.
+- Streaming body chunks arrive incrementally. The same timing predicate accepts
+  the real proxy and rejects a deliberately buffering canary that returns an
+  otherwise complete response.
+- Cancelling a tether during a stream ends the caller response and records a hub
+  state transition.
+- Completed streams release their concurrency slots. A 66-request regression
+  crosses the 64-concurrent-stream limit without turning that limit into a
+  lifetime request cap.
+- Hub command frames, per-stream request frames, tether WebSocket writes, and
+  caller response chunks use bounded queues with tested saturation behavior.
+- Only a tether `PONG` answering the hub's `PING` refreshes hub-side liveness.
+  Unrelated model traffic cannot make an unresponsive control loop appear
+  healthy.
+- Routable plaintext `ws://` hub URLs and non-loopback serving upstreams are
+  rejected. A routable deployment must terminate TLS before the Rust hub
+  listener and use `wss://`.
 
-**Real defect: a wedged tether can stream to a caller indefinitely, because its
-liveness proof is satisfied by traffic it is not processing.** In the fleet that
-is a GPU rental whose tunnel is alive-but-stuck while the engine behind it is
-gone -- the caller should be cut off, not fed.
+## Test-suite review
 
-### I-6 fix plan -- staged, each step independently verifiable
+The test suite retains behavior coverage while removing avoidable work:
 
-Ordered so the riskiest reasoning is tested before it is relied on. Each step names
-its own proof, and the suite must stay at 54 lib + forward_e2e 3/4 (plus the new
-assertions) after every step, with `tether_death_midstream_ends_the_caller` turning
-green only at step 4.
+- The shared HTTP chunk decoder moved under `tests/common`, so Cargo no longer
+  compiles and launches it as a separate zero-test integration target.
+- A duplicated full-topology tether-cancellation test was removed;
+  `forward_e2e::tether_death_midstream_ends_the_caller` retains the stronger
+  response-end and hub-state assertions.
+- Raw-socket tests stop when the declared HTTP body is complete instead of
+  waiting three, five, or eight seconds for a keep-alive connection to close.
+- Proxy tests and live harnesses use operating-system-assigned loopback ports
+  instead of project-wide fixed port numbers.
+- Live harnesses wait for health or log readiness instead of fixed startup
+  sleeps.
+- The idle soak returns a failing exit status for invalid startup or observed
+  connection churn and stores logs in a private temporary directory.
 
-1. **Deterministic sink teardown.** The session currently ends with the reader half
-   only; `ws.split()` means the writer task keeps the socket open, so the peer sees
-   a live connection forever. Take explicit ownership: signal the writer task, await
-   it, then drop the sink, so session end actually closes TCP.
-   PROOF: a probe that aborts the tether's task and asserts the HUB observes death
-   within ~2s (currently it observes none -- measured 74x `stream.next -> Some(Ok)`).
-   EVIDENCE (observed, not theorized): a tether with no request in flight emitted
-   ~700 WS frames (heartbeats/pings) before it was killed. Liveness measured as
-   'any inbound traffic' therefore reports a stuck tether as alive forever, and the
-   45s watchdog can never fire -- which is exactly the measured 65s-of-streaming
-   failure. The keepalive must be answered by the CODE THAT PROCESSES STREAMS, not
-   by the socket layer.
-2. **Reachability is not liveness.** Stop letting any inbound byte refresh
-   `last_seen`: keepalive must be a bidirectional proof (hub Ping -> tether Pong
-   within one interval), because a tether stuck mid-loop still answers Pings.
-   PROOF: a fixture tether that answers Pong but never processes OPEN, asserted to be
-   declared dead within the window -- and NOT declared dead while genuinely working.
-3. **Bounded command channel.** `LiveSession.tx` is an `UnboundedSender<Frame>`, so a
-   wedged tether accumulates hub memory without limit (fleet-wide blast radius, see
-   below). Bound it; refuse new streams when full and fail that caller fast rather
-   than queueing toward an engine that cannot answer.
-   PROOF: a probe that fills the bound and shows the caller gets a fast 503 while
-   existing streams finish, instead of unbounded queueing.
-4. **End the callers.** Only once 1-3 hold: on session exit, end every stream that
-   tether was serving (the drain written at the loop exit works once the exit is
-   reachable), and surface an explicit `tether_gone` so the frontend can cut callers
-   off without waiting on the watchdog.
-   PROOF: `tether_death_midstream_ends_the_caller` passes; caller sees the stream END
-   rather than a fabricated terminator (I-11) or a hang.
+During the 2026-08-31 review, the complete Rust suite decreased from 19.87 seconds
+at the start of the review to 10.92 seconds after the changes. The
+`forward_e2e` target decreased from 9.66 to 1.68 seconds. The `proxy_e2e` target
+now takes 2.77 seconds including the restored 1.2-second buffering comparison;
+before the review it took 9.39 seconds without that comparison.
 
-Do NOT start at step 4: cutting callers off is only correct once the hub can actually
-tell a dead tether from a busy one, which is exactly what steps 1-2 establish.
+## Documentation review
 
-Also fixed while investigating, and it stays fixed: `decode` used to return
-`Ok(None)` for `Message::Text`/`Message::Frame`, which would have made a real RST
-look like a keepalive and the loop spin on a dead socket. Now terminal.
+The public documentation now:
 
-## Test topology currently in use
-CANONICAL GATE (committed, reboot-safe): `cargo/scripts/live_stream_gate.py`
-regenerates the whole topology and asserts no-truncation, head-first-from-engine,
-and not-buffered. Run: `python3 cargo/scripts/live_stream_gate.py`. Prefer this
-over the /tmp scratch probes below, which are ephemeral and will not survive a
-reboot (they are kept only as history of what was measured).
-engine `spyengine.py` :19905 -> tether -> hub :19920 (frontend :19922), credential
-`tun`, caller token `cal`. `/tmp/caller_paced.py` (timing truth),
-`/tmp/caller_total.py` (drain-to-EOF count), `/tmp/spyengine.py` (what the engine
-actually writes, with timestamps), `/tmp/reuse_test.py` (id reuse).
+- defines hub, tether, caller frontend, rental, serving upstream, loopback,
+  registration, credentials, authorization lifetime, tunnel stream,
+  server-sent events, bounded flow control, HTTP header categories, and both
+  project portals in `docs/concepts.md`;
+- describes architectural guarantees by behavior rather than identifier-only
+  labels;
+- explains how Anvil Ring carries requests while Anvil Serving owns model
+  lifecycle and the mapping from stable capability names to model
+  configurations;
+- distinguishes the documentation portal from the main GitHub project portal
+  and from a runtime administration interface;
+- documents exact commands, environment variables, status codes, launch checks,
+  rollback order, and the blockers for unattended or multi-rental deployment;
+  and
+- condenses obsolete investigation scratch notes into one current incident
+  history page.
 
-## Instrumentation currently in the tree (remove before shipping)
-- `hub.rs::StreamGuard::drop` -> `GUARD drop id=.. completed=..`  <-- keep until I-6 is resolved
-- `frontend.rs::poll_next` -> `BODY poll_next -> Chunk/END`        <-- same
-- probe tests: `sender_teardown_probe`, `hub_to_caller_body`, `hyper_body_probe`,
-  `chunk_backpressure_probe`, `coalesced_head_probe` — each is a proof of innocence
-  for a component; keep them, they are cheap and they encode real contracts.
+Portal checks on 2026-08-31 returned:
 
-## COVERAGE GAP (do not read the probe suite as covering this)
-The crashed-process case -- both socket halves gone, peer receives a real RST -- is
-NOT tested. It IS detected: the hub logs 'Connection reset without closing
-heartbeat', and after the `decode` fix an unexpected message is terminal rather
-than swallowed. But the probe cannot exercise it, because `run_client` owns the
-connection and the test harness cannot force SO_LINGER=0 / hard-close that socket.
-Closing that gap needs either a test hook in `run_client` (e.g. accept an already
-built WebSocket) or a fixture tether that exits without closing.
+| URL | HTTP result | Meaning |
+|---|---:|---|
+| `https://github.com/fakoli/anvil-ring` | 200 | Main Anvil Ring project portal is available |
+| `https://fakoli.github.io/anvil-ring/` | 404 | Documentation portal requires GitHub Pages enablement and a successful workflow run from `main` |
+| `https://fakoli.github.io/anvil-serving/` | 200 | Anvil Serving documentation is available |
+| `https://github.com/fakoli/anvil-serving` | 200 | Main Anvil Serving project portal is available |
 
-`tests/i6_tether_death_probe.rs` covers ONLY the leaked-socket case (task aborted,
-sink retained by the writer task). Its docstring says so; keep it that way.
+A fresh check on 2026-09-05 still returned 404 for the Anvil Ring documentation
+portal. The other portal results above remain historical.
 
-## PANIC FIX: bare-LF header terminator underflowed `reframe_head_for_tunnel`
+Runtime and Python help include the intended documentation portal, the working
+documentation-source fallback in GitHub, and the main project portal.
 
-A stale-tether panic report (`attempt to subtract with overflow`, src/tunnel.rs)
-was from an OLD binary (its `TT k=` trace string is not in HEAD source) -- but the
-same arithmetic existed at HEAD and was reproduced as a live crash.
+## Transport baseline verification (before durable administration)
 
-`find_header_end` matches `\r\n\r\n` (returns i+4) OR bare `\n\n` (returns i+2).
-`reframe_head_for_tunnel` sliced `&head[..end - 4]`, so a bare-LF head (end=2)
-underflowed and panicked. A panic here kills the tether worker and every stream
-multiplexed over the tunnel -- far worse than a wrong byte.
+The following results were produced before the durable administration changes on
+2026-09-05. They remain historical transport evidence, not the final durable build. They qualify the local transport and packaging changes; they are
+not evidence of a published release or an operated rental deployment.
 
-Fix: only run the CRLF reframe when the terminator really is CRLF-CRLF; a bare-LF
-head passes through UNCHANGED (rewriting LF fields to CRLF could split a value
-containing a bare LF, so normalization would be wrong, not just risky).
-tests/bare_lf_head_panic_probe.rs pins both cases (2/2).
+| Command or check | Result |
+|---|---|
+| `cargo fmt --all -- --check` | Passed |
+| `cargo test --locked --all-targets -- --test-threads=1` with Rust 1.96 | 124 passed, 0 failed, 0 ignored |
+| `cargo +1.85.0 test --locked --all-targets -- --test-threads=1` | 124 passed on the declared minimum Rust version |
+| Rust 1.85 full suite in Linux ARM64 Alpine | 124 passed, including the crashed-process TCP-reset fixture |
+| Rust 1.85 full suite in Linux x86-64 Alpine under emulation | 124 passed, including the crashed-process TCP-reset fixture |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed with no warnings |
+| `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps` | Passed |
+| Python 3.11 pytest, Ruff, lock validation | 16 tests passed; Ruff and lock validation passed |
+| `actionlint` 1.7.12 | Both workflows passed |
+| `uv build` | Source distribution and pure-Python wheel built |
+| `mkdocs build --strict` | Passed after the release-documentation update |
+| `live_stream_gate.py --events 6 --gap 0.4` | Passed; events at 0.00, 0.41, 0.81, 1.22, 1.63, and 2.03 seconds |
+| `soak_tunnel.py 65 ...` | Passed; one authorization, zero resets/refusals/dial failures/tunnel errors; all processes alive |
+| Both Linux musl release binaries | Correct ELF architecture; no dynamic loader; each starts as UID/GID 65534 with no network or Linux capabilities |
 
-Gate after the fix: 54 lib, forward_e2e 3/4 (I-6 only), proxy_e2e 5/5, live
-streaming 6/6 with `GUARD drop id=1 completed=true` after all six chunks.
+### Transport changes verified in this session
 
-## Link stability: MEASURED steady state (my reset-frequency worry was wrong twice)
+The tether uses Hyper's HTTP/1 framing for each engine exchange. Fragmented
+headers, fixed lengths, chunked completion, early responses during stalled
+uploads, repeated and byte-valued headers, and truncated responses have
+full-path regression coverage. Unsupported transfer codings fail explicitly.
 
-A field log showed repeated `authorized -> Up -> reset -> authorized` cycles for one
-tether, which made me raise a "tunnels reset after seconds" concern. A 100 s soak
-(hub + tether, nothing killed, no requests) gives the answer:
+A failed stream produces an HTTP body error instead of a successful chunked
+terminator. Independent completion/failure notification remains live when a
+response queue is full. Owned tasks cancel on stream or session teardown.
+Admission, completion, and upload-installation races have focused tests;
+the final-chunk test exercises 10,000 producer/consumer interleavings.
+A separate deterministic test exhausts Tokio's cooperative budget: `Pending`
+cannot be treated as proof that the response queue is empty. Completed streams
+close the receiver and drain it to its own EOF.
 
-    1 authorization, 0 resets, 0 refusals, 0 dial failures, tunnel Up, all alive
-    VERDICT: STEADY STATE -- the link does not flap on its own.
+Startup rejects user-info and query-bearing upstream URLs without logging
+secrets. Both proxy and tether connect to validated literal loopback addresses;
+the proxy no longer performs a second hostname lookup after validation.
 
-So those resets WERE teardown (harness pkill), as first claimed. The soak initially
-failed for reasons that were entirely harness bugs, and I proposed THREE wrong
-explanations before finding it:
-  1. "a stale /opt/homebrew/bin copy answered" -- FALSE: no such file exists.
-  2. "an old installed binary lacking hub/tether subcommands" -- FALSE: the binary at
-     the absolute path is current (`--help` lists all subcommands).
-  3. "a zombie bound the port and answered first" -- FALSE: the fixture binds WITHOUT
-     SO_REUSEADDR, so a successful bind proves the port was free.
-The real cause: the hub registers its demo tether from ANVIL_RING_DEMO_CREDENTIAL,
-and I dials with a DIFFERENT ANVIL_RING_CREDENTIAL. `refused tether` +
-`ended: unauthorized` was I-5 working correctly. I-8 (authorize never says which half
-was wrong) is why a credential typo is indistinguishable from a protocol bug -- which
-is ALSO why the soak must use ONE unique value for both sides and assert `tunnel
-reached Up` before interpreting any count.
+The hub enforces its lease deadline even with an unresponsive WebSocket writer.
+Revocation and credential replacement cancel active sessions, and authorization
+is rechecked when attaching a connection. A killed child tether with zero socket
+linger produces a witnessed TCP reset and a failed caller response. This runs
+on both macOS and Linux.
 
-## Minor robustness fix (defect real, urgency lower than I first assumed)
+See [ADR-0006](docs/adr/0006-http-framing-and-terminal-state.md) and
+[Testing](docs/testing.md) for the contracts and their limits.
 
-`Registry::detach(id)` was an unguarded `live.remove(id)`. On re-authorization the NEW
-session is installed under the same tether id, so when the OLD session's loop exits it
-deletes the NEW live session: a healthy tunnel left connected but unroutable (every
-caller gets 502 NoTether) with nothing to repair it, since the survivor is never told.
-Fixed with a per-session `generation` stamp and compare-before-remove.
+### Historical transport-only Linux build identity
 
-Corrected urgency: the soak shows re-authorization is rare in steady state, so this is
-a latent robustness fix, not the cause of the observed churn. Verified: 54 lib tests,
-forward_e2e 3/4 (only I-6), and detach cannot be covered by a direct unit test -- it is
-private and only reachable through a real re-auth race.
+These are development binaries, built with Rust 1.85 in
+`rust:1.85-alpine@sha256:4333721398de61f53ccbe53b0b855bcc4bb49e55828e8f652d7a8ac33dd0c118`.
+ARM64 ran natively in the local Linux VM; x86-64 ran under emulation.
+The final Linux suites and release builds used a frozen copy of the Cargo
+sources; subsequent documentation edits could not overlap compilation.
+They include uncommitted changes on top of `b180fe0` and are not represented as
+artifacts of that commit alone.
 
-## I-6 DESIGN INPUT (measured, not assumed): the hub->tether command path is UNBOUNDED
+| Target | Binary SHA-256 |
+|---|---|
+| `aarch64-unknown-linux-musl` | `8d5aca9f7fac4822e0d1d184ee7f11e2db4f807f57625f273481bd4ceda5e94c` |
+| `x86_64-unknown-linux-musl` | `35c705bc625af6a32bb32657886e3595d48be80ad77269f4ff8a583892895bb3` |
 
-Confirmed by grep, not inference:
-  - hub.rs:79  `LiveSession.tx: mpsc::UnboundedSender<Frame>`   (hub -> tether commands)
-  - hub.rs:772 `mpsc::unbounded_channel::<Frame>()`             (per-session)
-  - tunnel.rs:176/216 unbounded writer task + per-stream senders on the tether side
+The release workflow now prepares a tar archive preserving executable
+permissions, checksums, a target-specific CycloneDX Cargo SBOM, source identity,
+and signature bundles. Attestation requires successful build and test jobs and
+is limited to trusted main/tag runs. This workflow has not yet been run on
+GitHub for these changes, so no new signed release or attestation is claimed.
 
-Consequence for I-6: a tether that is connected-but-not-processing (the measured
-65-seconds-of-streaming case) also means every OPEN/HEAD/BODY frame the hub pushes
-into `LiveSession.tx` queues in hub RAM with NO ceiling. So the wedged-tether defect
-is not only "a caller is never cut off" -- it is unbounded hub memory growth per
-wedged tether. In the fleet: one rental whose loop wedges while callers keep
-requesting can grow hub memory until the hub process dies, taking every OTHER
-tether's tunnels with it. Blast radius is the whole fleet, not one call.
+## Durable administration and routing — final local verification
 
-That makes a bounded command channel part of the I-6 fix, not a later hardening
-step: bound it, and refuse new streams when full (fail the caller fast with 503 on
-that tether) rather than queueing toward an engine that cannot answer.
-Response direction VERIFIED bounded in BOTH of its hops (grep, not inference):
-  - hub.rs:324 `mpsc::channel::<ChunkOrEnd>(64)` -- per-stream, capacity 64
-  - hub.rs:101/484 `chunk_tx: mpsc::Sender<ChunkOrEnd>` (not Unbounded)
-  - and `pending` holds body bytes so a caller cannot outrun the tunnel
-A stalled caller therefore applies backpressure the whole way back instead of
-buffering. The gap is ONLY the outbound command direction (hub.rs:79
-`UnboundedSender`). So step 3 is ONE channel, not a redesign: bound
-`LiveSession.tx`, refuse new streams when full, leave the response path alone.
+The current implementation adds hub-local SQLite state and the OS-authenticated
+`admin` command. Registration, credential issuance/rotation/expiry/revocation,
+transactional audit, and deterministic least-loaded routing are implemented.
+Private credential files are synchronized before commit; tokens are not stored
+in plaintext or printed. Every 500 ms the hub refreshes the registrations; read
+failure or a two-second read timeout clears authorization and cancels sessions.
+All tethers in one hub must expose the same serving contract.
 
-## Confirmed design intent (operator, 2026-08-28): drop-and-redial is the design
+The final source was frozen before the Linux builds and checked byte-for-byte
+against all 30 Cargo input files afterward. Verification on 2026-09-05:
 
-Asked whether hub<->tunnel resets are routine in the fleet (which would shape how
-strict the I-6 fix must be), the answer is: **no problem to design around -- the
-tunnel is meant to drop and redial, and a redial is a normal, correct event.**
+| Check | Result |
+|---|---|
+| Full Rust stable 1.96 suite on macOS ARM64 | 149 passed, 0 failed, 0 ignored |
+| Full Rust 1.85 suite on macOS ARM64 | 149 passed, 0 failed, 0 ignored |
+| Full Rust 1.85 suite on Linux ARM64 musl | 149 passed, 0 failed, 0 ignored |
+| Full Rust 1.85 suite on Linux x86-64 musl under emulation | 149 passed, 0 failed, 0 ignored |
+| Formatting, clippy with warnings denied, rustdoc with warnings denied | Passed |
+| Python pytest and Ruff | 16 passed; lint passed |
+| Lock validation, Python package build, actionlint | Passed |
+| Strict documentation build | Passed with the final administration and verification documentation |
+| Streaming gate, six events at 0.4-second intervals | Passed: 0.00, 0.40, 0.81, 1.21, 1.61, 2.01 seconds |
+| 65-second idle soak | Passed: one authorization, zero resets/refusals/dial failures/tunnel errors, all processes alive |
+| Both Linux release binaries | Expected architecture, static linkage, no dynamic loader |
+| Packaged checksums and private SQLite administration as UID/GID 65534 | Passed on both architectures with read-only root, no capabilities, and no network |
 
-Two consequences the I-6 fix must respect:
+The new tests cover 16 storage scenarios, real CLI/hub/tether lifecycle across
+restarts and store loss, stable routing with a held response, and 128 concurrent
+streams across two real tethers followed by 503 when both are full. Persisted
+expiry is moved into the past in the process test; lease timing has separate
+live transport coverage. Credential crash durability relies on SQLite and
+file/parent synchronization ordering plus forced commit-failure tests; no
+power-loss or physical-disk crash qualification is claimed.
 
-1. Do NOT add reconnect damping, backoff growth, or 'too many reconnects -> alarm'
-   logic. Backoff exists only for the DIAL side (tunnel.rs BACKOFF_MIN..MAX) and is
-   correct there; do not extend that idea to session teardown.
-2. Because re-authorization is EXPECTED to be routine, the `detach` clobber is more
-   important than my soak implied. I downgraded it to 'latent' after measuring one
-   authorization per 100s idle soak -- but that soak had no reason to reconnect, so
-   it measured an idle tunnel, not a reconnecting one. Every real reconnect hits
-   exactly the path where an old session's exit deletes the new live session under
-   the same tether id. Keep the generation guard, and step 1 of the plan should show
-   a RECONNECT (not just a teardown) leaving the tunnel routable.
+These **unsigned development artifacts** include uncommitted changes above
+`b180fe0` on `codex/durable-hub-control`. Their metadata marks the source dirty.
+The target-specific SBOMs include bundled SQLite's Cargo dependency.
 
-Still worth a live check when convenient: how often the fleet's tethers actually
-redial, so the reconnect path gets proportional test coverage. The soak script is now IN-REPO and
-reboot-safe: `python3 cargo/scripts/soak_tunnel.py <secs> "$PWD/target/debug/anvil-ring"`
-(pass the binary explicitly -- it refuses to guess, because a stale binary from PATH
-cost hours during this investigation). It asserted steady state on an idle tunnel:
-1 authorization, 0 resets, 0 refusals, 0 dial failures, tunnel Up, all procs alive.
-NOTE: it measures an IDLE tunnel. It cannot measure reconnect frequency, because an
-idle tunnel has no reason to reconnect -- so do not read its verdict as "reconnects are
-rare in production". That misread is what made me downgrade the detach clobber to
-"latent" (corrected in the section above).
+| Target | Current binary SHA-256 | Local archive |
+|---|---|---|
+| `aarch64-unknown-linux-musl` | `035739d89c1257fdd2b5970f08c481b8d8ebf308b8c2a2754d8347890b8dad35` | `dist/linux-arm64/anvil-ring-0.1.0-aarch64-unknown-linux-musl.tar.gz` |
+| `x86_64-unknown-linux-musl` | `cccac915ee5295d74fcd27aed60fb1f0f6ff24a6a36dd436787170bfbf3a9b02` | `dist/linux-amd64/anvil-ring-0.1.0-x86_64-unknown-linux-musl.tar.gz` |
 
-## OPERATOR RULE (absolute): never touch the operator's daily-driver host
+Historical transport-only artifacts remain under `dist/transport-baseline/`.
+Source review found no material correctness or security defects; its two-tether
+capacity coverage gap was closed by the 128-stream test. See
+[ADR-0007](docs/adr/0007-durable-hub-administration.md) for the operating contract.
 
-Restated by the operator twice, so it is recorded here as well as in agent memory:
-**the operator's daily-driver host is OFF LIMITS to me entirely.** No SSH to it, nothing read from it, nothing
-run on it — no builds, containers, processes, config changes, probing, or read-only
-"quick tests". It is the operator's active Mac and it HOSTS FLEET SERVICES (Docker
-Desktop: serving containers, the Hermes gateway/dashboard, n8n app + postgres, webui),
-so any action there risks interrupting his co-work or taking services down.
+## Work still required before unattended or multi-rental deployment
 
-Consequences for this project:
-- Do NOT propose mbp25 as a linux/amd64 / musl / `docker buildx` release-build host.
-  That idea is explicitly rejected, not merely deferred.
-- Do NOT install colima on Mini either (it cannot emulate x86_64).
-- All anvil-ring build/test work stays on the build host (arm64) under ~/workspace-work.
-  That means debug/CLI/test work only. A real linux/amd64 release artifact has NO
-  authorized build host right now: if one is ever needed, STOP and ask the operator
-  where it happens rather than picking a machine.
-- This project is local-git only, no remote, and `anvil-ring` is the only binary name
-  (no alias).
+1. Document and operate TLS termination, certificate issuance, certificate
+   rotation, and caller-frontend network restrictions in the target environment.
+2. Run the exact-target TLS diagnostic from every intended provider image as the
+   same unprivileged user that will run the tether.
+3. Run the updated release workflow from a clean, reviewed commit and verify
+   the downloadable checksums, SBOM, signature bundles, and build provenance.
+   Local builds and packaging pass; trusted GitHub signing and publication
+   remain unverified.
+4. Build and run the combined vLLM-and-tether container on an authorized Linux
+   GPU host with a real model. The local supervisor test uses controlled fake
+   children and cannot replace that run.
+5. Publish the documentation portal by enabling GitHub Pages with GitHub Actions
+   and verifying the deployed URL.
+6. Define measured capacity, latency, availability, recovery-time, and incident
+   response objectives before increasing traffic or rental count.
 
-## MEMORY-HYGIENE LESSON (from tonight)
-
-Durable memory has a hard char budget (~4k) and `replace` swaps the ENTIRE entry that
-matches `old_text`. Consolidating the mbp25 rule into the anvil-ring entry therefore
-DELETED the project facts (local-git-only, binary-name directive, "progress lives in
-STATE.md") while looking like a clean success — the tool reported "Write saved" and the
-usage went down, which reads as a good outcome.
-
-So: never store a new rule by replacing an informative entry. Add a short standalone
-entry, and only replace an entry with text that contains everything that entry already
-said. Anything an entry merely *summarizes* should live in the repo (STATE.md), which is
-versioned, auditable, and cannot be evicted by memory churn.
+The canonical commands and environment-specific checks are in
+[`docs/testing.md`](docs/testing.md) and
+[`docs/production-rollout.md`](docs/production-rollout.md).

@@ -1,81 +1,104 @@
-# anvil-ring (Rust)
+# anvil-ring Rust runtime
 
-Outbound-initiated reverse proxy: the **tether** runs beside a local inference port on a
-machine you don't control (a GPU rental) and dials OUT to the **hub** on your own network.
-Nothing listens on the rental, so there are no inbound firewall rules, no port-forwards,
-and no root. Invariants and their enforcement sites: `../docs/invariants.md`.
+The Rust crate contains the production proxy, hub, tether, binary frame codec,
+streaming body, lifecycle ownership, and network harnesses.
 
-## Layout
+[Documentation portal (publication pending)](https://fakoli.github.io/anvil-ring/) ·
+[Main project portal](https://github.com/fakoli/anvil-ring)
 
-```
-src/        hub.rs (hub + caller frontend)  tunnel.rs (tether + framing)
-            proxy.rs (plain single-target proxy)  wire.rs (frame codec)  main.rs
-tests/      forward_e2e.rs  end_to_end.rs  proxy_e2e.rs  bare_lf_head_panic_probe.rs
-            wire_probe.rs   integration.rs
-scripts/    live_stream_gate.py   soak_tunnel.py   (see "Verification harnesses")
-```
+Until GitHub Pages is enabled, read the same documentation from
+[`../docs/index.md`](../docs/index.md) in the main project portal.
 
-Three run modes, all from one binary (always the `anvil-` prefix; there is no bare
-`ring` command):
+“Production” here identifies the Rust request-transport implementation, not
+approval for an unattended or multi-rental deployment. Durable registration,
+local administration, and deterministic routing are locally verified;
+target-dependent rollout gates remain open.
+See the [production rollout guide](../docs/production-rollout.md) before using it
+outside a controlled single-rental pilot.
 
-| Mode | Listens | Purpose |
-|---|---|---|
-| `anvil-ring hub` | hub ports only | Registry + caller frontend; authorizes tethers, routes calls |
-| `anvil-ring tether` | **nothing** | Outbound only (I-1); proxies to a loopback upstream (I-10) |
-| `anvil-ring` | loopback | Plain single-target proxy, no tunnel (dev/fallback) |
+## Modes
+
+| Command | Role |
+|---|---|
+| `anvil-ring proxy` or `anvil-ring` | Local authenticated reverse proxy |
+| `anvil-ring hub` | Tether listener plus optional authenticated caller frontend |
+| `anvil-ring tether` | Outbound-only rental client and loopback engine proxy |
+| `anvil-ring admin` | Local durable registration, credential, and audit administration |
+
+Run `anvil-ring --help` for the complete environment contract. Modes accept no
+extra command-line arguments; secrets and configuration stay out of process
+arguments.
+The rendered reference is in [`../docs/cli-reference.md`](../docs/cli-reference.md).
+
+## Source ownership
+
+| File | Responsibility |
+|---|---|
+| `src/main.rs` | Mode dispatch and environment configuration |
+| `src/hub.rs` | Registry, authorization, tether sessions, stream routing, liveness |
+| `src/tunnel.rs` | Outbound client, reconnect and authorization-renewal loop, engine request tasks, WebSocket writer |
+| `src/frontend.rs` | Caller HTTP listener and streaming response body |
+| `src/proxy.rs` | Local single-upstream proxy and loopback/auth guards |
+| `src/frames.rs` | Binary tunnel protocol |
+| `src/chunked.rs` | Incremental transfer-coding decoder |
+| `src/headers.rs` | Hop-by-hop header filtering |
+
+See [`../docs/architecture.md`](../docs/architecture.md) for the full request and
+lifecycle contracts.
 
 ## Build
 
 ```bash
-cargo build            # debug binaries: target/debug/anvil-ring
-cargo build --release
+cargo build --locked --bin anvil-ring
+cargo build --release --locked --bin anvil-ring
 ```
+
+Static Linux artifacts are built with musl in CI. See
+[`../docs/cross-build.md`](../docs/cross-build.md).
 
 ## Test
 
 ```bash
-cargo test --lib                                  # unit tests
-cargo test --test forward_e2e -- --test-threads=1 # end-to-end (see caveat)
-cargo test --test proxy_e2e
+cargo fmt --check
+cargo test --locked --all-targets -- --test-threads=1
+cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Verified from a clean copy of `Cargo.toml`/`Cargo.lock`/`src`/`tests` with no other
-repo state: `cargo test --lib` -> 54 passed.
+Serial integration execution is load-bearing: harnesses bind loopback ports and
+parallel collisions can resemble tunnel failures.
 
-**Run integration tests with `--test-threads=1`.** They bind fixed loopback ports, so
-two tests running concurrently collide and fail in ways that look like product bugs.
-
-### Test-environment traps (each cost real time)
-- **`/tmp` is not writable here, and `spawn_blocking` + `std::fs` ignores an
-  overridden `TMPDIR`.** Use `tokio::fs` for any temp file in a test, or the failure is
-  a red herring.
-- **Never add `SO_REUSEADDR` to a test bind.** A reuse-bind can succeed while a
-  different process answers on that port, so the test silently measures something else.
-  A clean bind proves the port was ours. If a port is held, change the port pair.
-- **Always pass the binary by path when a harness takes one.** A stale binary from
-  `PATH` produces confident, wrong results.
-
-## Verification harnesses
-
-Both are in-repo (the scratch copies in `/tmp` did not survive a reboot, which lost a
-gate once) and both use inert local credentials plus `127.0.0.1` only.
+Focused lifecycle verification:
 
 ```bash
-# Streaming contract: no truncation, response head arrives first and comes from the
-# engine (not fabricated), and delivery is paced rather than buffered. Exit 0 = pass.
-python3 scripts/live_stream_gate.py --events 6 --gap 0.8
+cargo test --test forward_e2e -- --test-threads=1
+```
 
-# Link stability: hold one tunnel open, touch nothing, count re-authorizations and
-# resets. Verdict is STEADY STATE unless the link actually flaps.
+`forward_e2e` covers the complete caller-to-engine path, streaming cadence,
+authentication ordering, no-tether status, tether cancellation, and more than
+one full concurrency window of sequential requests. Tether cancellation is a
+required passing regression, not an expected failure.
+
+The buffering canary is a test-only executable. `proxy_e2e` requires the real
+proxy to pass the incremental-arrival predicate and the canary to fail the same
+predicate while returning the complete body. ADR-0005 records the comparison.
+
+## Live local harnesses
+
+```bash
+cargo build --bin anvil-ring
+python3 scripts/live_stream_gate.py --events 6 --gap 0.8
 python3 scripts/soak_tunnel.py 100 "$PWD/target/debug/anvil-ring"
 ```
 
-The soak measures an **idle** tunnel. An idle tunnel has no reason to reconnect, so its
-verdict says nothing about reconnect frequency — do not read it as "reconnects are rare".
+The streaming harness requires the caller to receive the engine's status, every
+event, and incremental delivery. The soak measures whether one idle authorized
+connection reconnects or resets during the observation window.
 
-## Open defect: I-6
+## Test-environment cautions
 
-`tether_death_midstream_ends_the_caller` in `tests/forward_e2e.rs` **fails by design**:
-it is the standing red light for a caller that is never terminated when its tether dies.
-Treat 3/4 on `forward_e2e` as the expected state, not a regression. Plan, measurements,
-and the ordering rationale are in `../STATE.md`.
+- Pass an explicit binary path to scripts; a stale `anvil-ring` on `PATH` can
+  produce convincing results from old code.
+- Do not loosen harness listeners with `SO_REUSEADDR`; a successful reused bind
+  does not prove the test owns the port.
+- Prefer ephemeral loopback ports for new tests.
+- A macOS build does not verify Linux musl linking or a GPU container.
